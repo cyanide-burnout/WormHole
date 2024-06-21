@@ -223,6 +223,7 @@ static int ReadSystemValue(int handle, const char* kind, const char* parameter, 
   // /proc/self/fd/NNN -> /dev/uio0 -> /sys/class/uio/uio0/maps/map1/size
 
   snprintf(temporary1, PATH_MAX, "/proc/self/fd/%d", handle);
+  memset(buffer, 0, size);
 
   result = -1;
   handle = -1;
@@ -260,14 +261,12 @@ static struct WormHole* CreateGuestWormHole(const char* path, struct stat* statu
   char buffer[64];
   size_t size;
 
-  memset(buffer, 0, sizeof(buffer));
-
   size = getpagesize();
   hole = (struct WormHole*)calloc(1, offsetof(struct WormHole, guest) + sizeof(struct GuestWormHole));
 
   if (((hole->handle          = open(path, O_RDWR | O_SYNC | O_CLOEXEC)) < 0) ||
-      (ReadSystemValue(hole->handle, "class/uio", "maps/map1/size", buffer, sizeof(buffer)) < 2) ||
-      ((hole->length          = strtoumax(buffer + 2, NULL, 16)) == 0) ||
+      (ReadSystemValue(hole->handle, "class/uio", "name",           buffer, sizeof(buffer)) < 1) || (strcmp(buffer, "uio_ivshmem\n")                  != 0) ||
+      (ReadSystemValue(hole->handle, "class/uio", "maps/map1/size", buffer, sizeof(buffer)) < 2) || ((hole->length = strtoumax(buffer + 2, NULL, 16)) == 0) ||
       ((hole->memory          = (uint8_t*)mmap(NULL, hole->length, PROT_READ | PROT_WRITE, MAP_SHARED, hole->handle, size))    == MAP_FAILED) ||
       ((hole->guest.registers = (uint32_t*)mmap(NULL, IVSHMEM_BAR0_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, hole->handle, 0)) == MAP_FAILED))
   {
