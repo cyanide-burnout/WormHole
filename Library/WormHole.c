@@ -213,25 +213,19 @@ int HandleWormHoleHostServerEvent(struct WormHole* hole)
 
 #define IVSHMEM_BAR0_SIZE          256
 
-static int ReadSystemValue(int handle, const char* kind, const char* parameter, char* buffer, int size)
+static int ReadSystemValue(struct stat* status, const char* parameter, char* buffer, int size)
 {
-  char temporary1[PATH_MAX];
-  char temporary2[PATH_MAX];
-  char* name;
+  char path[PATH_MAX];
+  int handle;
   int result;
 
-  // /proc/self/fd/NNN -> /dev/uio0 -> /sys/class/uio/uio0/maps/map1/size
-
-  snprintf(temporary1, PATH_MAX, "/proc/self/fd/%d", handle);
+  snprintf(path, PATH_MAX, "/sys/dev/char/%d:%d/%s", status->st_rdev >> 8, status->st_rdev & 0xff, parameter);
   memset(buffer, 0, size);
 
   result = -1;
-  handle = -1;
+  handle = open(path, O_RDONLY);
 
-  if ((readlink(temporary1, temporary2, PATH_MAX) > 0) &&
-      (name = strrchr(temporary2, '/')) &&
-      (snprintf(temporary1, PATH_MAX, "/sys/%s%s/%s", kind, name, parameter) > 0) &&
-      ((handle = open(temporary1, O_RDONLY)) >= 0))
+  if (handle >= 0)
   {
     result = read(handle, buffer, size);
     close(handle);
@@ -265,8 +259,8 @@ static struct WormHole* CreateGuestWormHole(const char* path, struct stat* statu
   hole = (struct WormHole*)calloc(1, offsetof(struct WormHole, guest) + sizeof(struct GuestWormHole));
 
   if (((hole->handle          = open(path, O_RDWR | O_SYNC | O_CLOEXEC)) < 0) ||
-      (ReadSystemValue(hole->handle, "class/uio", "name",           buffer, sizeof(buffer)) < 1) || (strcmp(buffer, "uio_ivshmem\n")                  != 0) ||
-      (ReadSystemValue(hole->handle, "class/uio", "maps/map1/size", buffer, sizeof(buffer)) < 2) || ((hole->length = strtoumax(buffer + 2, NULL, 16)) == 0) ||
+      (ReadSystemValue(status, "name",           buffer, sizeof(buffer)) < 1) || (strcmp(buffer, "uio_ivshmem\n")                  != 0) ||
+      (ReadSystemValue(status, "maps/map1/size", buffer, sizeof(buffer)) < 2) || ((hole->length = strtoumax(buffer + 2, NULL, 16)) == 0) ||
       ((hole->memory          = (uint8_t*)mmap(NULL, hole->length, PROT_READ | PROT_WRITE, MAP_SHARED, hole->handle, size))    == MAP_FAILED) ||
       ((hole->guest.registers = (uint32_t*)mmap(NULL, IVSHMEM_BAR0_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, hole->handle, 0)) == MAP_FAILED))
   {
