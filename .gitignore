@@ -2,3 +2,16 @@
 *.o
 *.d
 *.so
+
+# kernel build artifacts
+*.ko
+*.ko.*
+*.o.*
+*.mod
+*.mod.c
+*.symvers
+*.order
+.*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
