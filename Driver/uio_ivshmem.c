@@ -2,9 +2,15 @@
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/io.h>
+#include <linux/mm.h>
 #include <linux/uio_driver.h>
 
 #define PCI_DEVICE_ID_QEMU_IVSHMEM  0x1110
+
+#ifndef PCI_IRQ_INTX
+// PCI_IRQ_LEGACY has been renamed to PCI_IRQ_INTX in Linux 6.8
+#define PCI_IRQ_INTX                PCI_IRQ_LEGACY
+#endif
 
 #define IVSHMEM_REGISTER_MASK       0
 #define IVSHMEM_REGISTER_STATUS     4
@@ -40,10 +46,10 @@ static int probe(struct pci_dev* device, const struct pci_device_id* identifier)
         if ((info->mem[0].addr          = pci_resource_start(device, 0)) &&
             (info->mem[0].internal_addr = pci_ioremap_bar(device, 0)))
         {
-          if (pci_alloc_irq_vectors(device, 1, 1, PCI_IRQ_LEGACY | PCI_IRQ_MSIX) >= 1)
+          if (pci_alloc_irq_vectors(device, 1, 1, PCI_IRQ_INTX | PCI_IRQ_MSIX) >= 1)
           {
             info->mem[0].size    = pci_resource_len(device, 0);
-            info->mem[0].size    = (info->mem[0].size + PAGE_SIZE - 1) & PAGE_SIZE;
+            info->mem[0].size    = PAGE_ALIGN(info->mem[0].size);
             info->mem[0].memtype = UIO_MEM_PHYS;
             info->mem[0].name    = "control";
             info->mem[1].addr    = pci_resource_start(device, 2);
