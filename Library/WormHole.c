@@ -105,38 +105,39 @@ static struct WormHole* CreateHostWormHole(const char* path, struct stat* status
   int64_t value;
   int handle;
 
-  hole = (struct WormHole*)calloc(1, offsetof(struct WormHole, host) + sizeof(struct HostWormHole));
-
-  address.sun_family = AF_UNIX;
-  hole->host.socket  = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  hole->host.memory  = -1;
-  hole->handle       = -1;
-  handle             = -1;
-
-  strncpy(address.sun_path, path, sizeof(address.sun_path));
-  memset(hole->host.handles, 0xff, sizeof(hole->host.handles));
-
-  if ((hole->host.socket < 0) ||
-      (connect(hole->host.socket, (struct sockaddr*)&address, sizeof(struct sockaddr_un)) < 0)                 ||
-      (ReadHostServerMessage(hole, &value, NULL, 0) < 0)               || (value  != IVSHMEM_PROTOCOL_VERSION) ||
-      (ReadHostServerMessage(hole, &hole->identifier, &handle, 0) < 0) || (handle != -1)                       ||
-      (ReadHostServerMessage(hole, &value, &hole->host.memory, 0) < 0) || (value  != -1)                       ||
-      (fstat(hole->host.memory, status) < 0)                                                                   ||
-      ((hole->memory = (uint8_t*)mmap(NULL, status->st_size, PROT_READ | PROT_WRITE, MAP_SHARED, hole->host.memory, 0)) == MAP_FAILED))
+  if (hole = (struct WormHole*)calloc(1, offsetof(struct WormHole, host) + sizeof(struct HostWormHole)))
   {
-    close(hole->host.socket);
-    close(hole->host.memory);
-    free(hole);
-    return NULL;
-  }
+    address.sun_family = AF_UNIX;
+    hole->host.socket  = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    hole->host.memory  = -1;
+    hole->handle       = -1;
+    handle             = -1;
 
-  hole->type    = HOLE_CLIENT_TYPE_HOST;
-  hole->release = ReleaseHostWormHole;
-  hole->kick    = KickHostWormHole;
-  hole->bell    = function;
-  hole->closure = closure;
-  hole->length  = status->st_size;
-  hole->size    = sizeof(uint64_t);
+    strncpy(address.sun_path, path, sizeof(address.sun_path));
+    memset(hole->host.handles, 0xff, sizeof(hole->host.handles));
+
+    if ((hole->host.socket < 0) ||
+        (connect(hole->host.socket, (struct sockaddr*)&address, sizeof(struct sockaddr_un)) < 0)                 ||
+        (ReadHostServerMessage(hole, &value, NULL, 0) < 0)               || (value  != IVSHMEM_PROTOCOL_VERSION) ||
+        (ReadHostServerMessage(hole, &hole->identifier, &handle, 0) < 0) || (handle != -1)                       ||
+        (ReadHostServerMessage(hole, &value, &hole->host.memory, 0) < 0) || (value  != -1)                       ||
+        (fstat(hole->host.memory, status) < 0)                                                                   ||
+        ((hole->memory = (uint8_t*)mmap(NULL, status->st_size, PROT_READ | PROT_WRITE, MAP_SHARED, hole->host.memory, 0)) == MAP_FAILED))
+    {
+      close(hole->host.socket);
+      close(hole->host.memory);
+      free(hole);
+      return NULL;
+    }
+
+    hole->type    = HOLE_CLIENT_TYPE_HOST;
+    hole->release = ReleaseHostWormHole;
+    hole->kick    = KickHostWormHole;
+    hole->bell    = function;
+    hole->closure = closure;
+    hole->length  = status->st_size;
+    hole->size    = sizeof(uint64_t);
+  }
 
   return hole;
 }
@@ -151,7 +152,7 @@ int HandleWormHoleHostServerEvent(struct WormHole* hole)
   {
     handle = -1;
     result = ReadHostServerMessage(hole, &number, &handle, MSG_DONTWAIT);
-    
+
     if (result <= 0)
     {
       if ((result < 0) && (errno == EINTR))
@@ -255,29 +256,31 @@ static struct WormHole* CreateGuestWormHole(const char* path, struct stat* statu
   char buffer[64];
   size_t size;
 
-  size = getpagesize();
-  hole = (struct WormHole*)calloc(1, offsetof(struct WormHole, guest) + sizeof(struct GuestWormHole));
-
-  if (((hole->handle          = open(path, O_RDWR | O_SYNC | O_CLOEXEC)) < 0) ||
-      (ReadSystemValue(status, "name",           buffer, sizeof(buffer)) < 1) || (strcmp(buffer, "uio_ivshmem\n")                  != 0) ||
-      (ReadSystemValue(status, "maps/map1/size", buffer, sizeof(buffer)) < 2) || ((hole->length = strtoumax(buffer + 2, NULL, 16)) == 0) ||
-      ((hole->memory          = (uint8_t*)mmap(NULL, hole->length, PROT_READ | PROT_WRITE, MAP_SHARED, hole->handle, size))    == MAP_FAILED) ||
-      ((hole->guest.registers = (uint32_t*)mmap(NULL, IVSHMEM_BAR0_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, hole->handle, 0)) == MAP_FAILED))
+  if (hole = (struct WormHole*)calloc(1, offsetof(struct WormHole, guest) + sizeof(struct GuestWormHole)))
   {
-    munmap(hole->guest.registers, IVSHMEM_BAR0_SIZE);
-    munmap(hole->memory, hole->length);
-    close(hole->handle);
-    free(hole);
-    return NULL;
-  }
+    size = getpagesize();
 
-  hole->type       = HOLE_CLIENT_TYPE_GUEST;
-  hole->release    = ReleaseGuestWormHole;
-  hole->kick       = KickGuestWormHole;
-  hole->bell       = function;
-  hole->closure    = closure;
-  hole->identifier = hole->guest.registers[IVSHMEM_REGISTER_POSITION];
-  hole->size       = sizeof(uint32_t);
+    if (((hole->handle          = open(path, O_RDWR | O_SYNC | O_CLOEXEC)) < 0) ||
+        (ReadSystemValue(status, "name",           buffer, sizeof(buffer)) < 1) || (strcmp(buffer, "uio_ivshmem\n")                  != 0) ||
+        (ReadSystemValue(status, "maps/map1/size", buffer, sizeof(buffer)) < 2) || ((hole->length = strtoumax(buffer + 2, NULL, 16)) == 0) ||
+        ((hole->memory          = (uint8_t*)mmap(NULL, hole->length, PROT_READ | PROT_WRITE, MAP_SHARED, hole->handle, size))    == MAP_FAILED) ||
+        ((hole->guest.registers = (uint32_t*)mmap(NULL, IVSHMEM_BAR0_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, hole->handle, 0)) == MAP_FAILED))
+    {
+      munmap(hole->guest.registers, IVSHMEM_BAR0_SIZE);
+      munmap(hole->memory, hole->length);
+      close(hole->handle);
+      free(hole);
+      return NULL;
+    }
+
+    hole->type       = HOLE_CLIENT_TYPE_GUEST;
+    hole->release    = ReleaseGuestWormHole;
+    hole->kick       = KickGuestWormHole;
+    hole->bell       = function;
+    hole->closure    = closure;
+    hole->identifier = hole->guest.registers[IVSHMEM_REGISTER_POSITION];
+    hole->size       = sizeof(uint32_t);
+  }
 
   return hole;
 }

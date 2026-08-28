@@ -1,6 +1,7 @@
 #ifndef WORMHOLE_H
 #define WORMHOLE_H
 
+#include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -59,17 +60,19 @@ struct WormHole* CreateWormHole(const char* path, HandleWormHoleBellFunction fun
 int HandleWormHoleHostServerEvent(struct WormHole* hole);
 void HandleWormHoleInterruptEvent(struct WormHole* hole, int64_t value);
 
-inline __attribute__((always_inline)) int KickWormHole(struct WormHole* hole, uint32_t identifier)
+static inline __attribute__((always_inline)) int KickWormHole(struct WormHole* hole, uint32_t identifier)
 {
   if ((hole != NULL) &&
-      (hole->release != NULL))
+      (hole->kick != NULL))
   {
     // Be sure it is safe
-    hole->kick(hole, identifier);
+    return hole->kick(hole, identifier);
   }
+
+  return -EBADF;
 }
 
-inline __attribute__((always_inline)) void ReleaseWormHole(struct WormHole* hole)
+static inline __attribute__((always_inline)) void ReleaseWormHole(struct WormHole* hole)
 {
   if ((hole != NULL) &&
       (hole->release != NULL))
