@@ -77,7 +77,7 @@ struct WormLoop* CreateWormLoop(struct FastRing* ring, struct WormHole* hole)
     case HOLE_CLIENT_TYPE_HOST:
       hole->extension = loop;
       hole->kick      = KickHostWormHole;
-      AddFastRingEventHandler(ring, hole->host.socket, POLLIN | POLLHUP, HandleHostServerEvent, loop);
+      AddFastRingPoll(ring, hole->host.socket, RING_POLL_READ | RING_POLL_ERROR | RING_POLL_HANGUP | RING_POLL_SHOT | RING_POLL_REPEAT, HandleHostServerEvent, loop);
       break;
 
     case HOLE_CLIENT_TYPE_GUEST:
@@ -101,7 +101,7 @@ void ReleaseWormLoop(struct WormLoop* loop)
         (hole->type == HOLE_CLIENT_TYPE_HOST))
     {
       // There are no frequent events, poll interface is enough
-      RemoveFastRingEventHandler(loop->ring, hole->host.socket);
+      RemoveFastRingPoll(loop->ring, hole->host.socket);
     }
 
     if ((descriptor = loop->descriptor) &&
