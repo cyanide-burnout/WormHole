@@ -157,8 +157,9 @@ for an object is named and is found by `OpenWormArenaDescriptor`.
 
 `UnlockWormArenaDescriptor` bumps the revision of the block after a write, and
 `CheckWormArenaDescriptor` tells the caller whether anything has happened to the
-block since it last looked: zero if nothing has, one if it has, and the callback of
-the descriptor is called in that case.
+block since it last looked: zero if nothing has, one if it has. It costs a single
+load and takes no lock, so it is what a peer walks its objects with once the
+doorbell has told it to look around.
 
 Descriptors of one block within one process are counted, so two of them are
 independent of each other.

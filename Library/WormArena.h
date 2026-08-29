@@ -48,8 +48,10 @@ extern "C"
 #define WORM_LOCK_DEADLINE(value)                      ((uint32_t)((value) & 0xffffffff))
 #define WORM_LOCK_EXPIRED(value, moment)               ((int32_t)((moment) - WORM_LOCK_DEADLINE(value)) > 0)
 
-// Peer packs the ivshmem peer ID together with the process ID on that peer,
-// so an owner can be claimed and compared by a single atomic operation
+// Peer packs the identity of a machine together with the process ID on it, so that
+// an owner can be claimed and compared by a single atomic operation. The identity is
+// a hash of what the machine calls itself and not the peer ID of ivshmem: the latter
+// is handed out anew on every connection and taken back when a peer leaves
 
 #define WORM_PEER(identifier, process)  (((uint64_t)(identifier) << 32) | (uint32_t)(process))
 #define WORM_PEER_IDENTIFIER(value)     ((uint32_t)((value) >> 32))
@@ -131,7 +133,7 @@ struct WormArenaLock
 struct WormArenaEntity
 {
   uint32_t number;                               // Entity number, the same as the slot in the magic
-  ATOMIC(uint64_t) peer;                         // Host ID and process ID of ivshmem
+  ATOMIC(uint64_t) peer;                         // Identity of the machine and the process on it, see WORM_PEER
   ATOMIC(uint64_t) time;                         // Validity time, nanoseconds of CLOCK_REALTIME
   uint64_t reserved[5];                          // Room to grow into, has to be kept zero until it is taken
   char name[64];                                 // Client name
@@ -179,12 +181,6 @@ struct WormArenaMagic
 
 // Local objects
 
-struct WormArena;
-struct WormArenaDescriptor;
-
-typedef void (*HandleWormArenaEntityChange)(struct WormHole* hole);
-typedef void (*HandleWormArenaBlockChange)(struct WormArenaDescriptor* descriptor);
-
 struct WormArena
 {
   pthread_rwlock_t lock;                         //
@@ -193,9 +189,8 @@ struct WormArena
   struct HashMap* entities;                      //
   struct WormArenaEntity* entity;                // Local entity
   uint64_t revisions[2];                         // Revisions of each collection
+  uint32_t host;                                 // Identity of this machine, see WORM_PEER
   pid_t process;                                 // Local Process ID
-  void* closure;                                 //
-  HandleWormArenaEntityChange change;            //
 };
 
 struct WormArenaDescriptor
@@ -206,8 +201,6 @@ struct WormArenaDescriptor
   uint32_t generation;                           // Generation of the lock while it is held
   uint32_t state;                                // WORM_LOCK_READ or WORM_LOCK_WRITE while locked, zero otherwise
   uint8_t* data;                                 // Pointer to the data of the block
-  void* closure;                                 //
-  HandleWormArenaBlockChange change;             //
 };
 
 struct WormArena* CreateWormArena(struct WormHole* hole, const char* name);

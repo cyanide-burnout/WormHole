@@ -1,5 +1,7 @@
 #include "WormArena.h"
+#include "CRC32C.h"
 
+#include <fcntl.h>
 #include <time.h>
 #include <errno.h>
 #include <malloc.h>
@@ -15,6 +17,42 @@
 _Static_assert(((uint64_t)WORM_ARENA_COLLECTIONS << 32) < WORM_SLOT_LOCK, "a pair of a slot must never carry the mark of a reservation");
 
 #define ALIGN_OFFSET(value)  (((value) + WORM_ARENA_ALIGNMENT - 1) & ~((uint64_t)WORM_ARENA_ALIGNMENT - 1))
+
+static uint32_t GetHostIdentifier()
+{
+  int handle;
+  int length;
+  uint8_t buffer[64];
+
+  // The peer ID of ivshmem is handed out by the server anew on every connection and
+  // is taken back when a peer leaves, so it says which connection this is rather than
+  // which machine. The identity of the machine is what an entity has to carry to stay
+  // the same across a reconnection and across a reboot: the arena outlives both, and
+  // an object left by a machine is still the object of that very machine afterwards.
+  //
+  // Machines cloned off one image carry the machine ID of that image, and nothing
+  // here can tell them apart, so an image is to be prepared with an identity of its own
+
+  length = 0;
+  handle = open("/etc/machine-id", O_RDONLY);
+
+  if (handle >= 0)
+  {
+    length = read(handle, buffer, sizeof(buffer));
+    close(handle);
+  }
+
+  if (length > 0)
+  {
+    //
+    return GetCRC32C(buffer, length, 0);
+  }
+
+  // The host ID is a poor second: glibc makes it up out of the address of the machine
+  // when there is no /etc/hostid, so it follows the network rather than the machine
+
+  return (uint32_t)gethostid();
+}
 
 static uint64_t GetCurrentTime()
 {
@@ -1148,7 +1186,7 @@ int RegisterWormArenaEntity(struct WormArena* arena, const char* name, int valid
       {
         entity->number = number;
 
-        atomic_store_explicit(&entity->peer, WORM_PEER(hole->identifier, arena->process), memory_order_relaxed);
+        atomic_store_explicit(&entity->peer, WORM_PEER(arena->host, arena->process), memory_order_relaxed);
 
         memset(entity->name, 0, sizeof(entity->name));
         strncpy(entity->name, name, sizeof(entity->name) - 1);
@@ -1192,7 +1230,7 @@ int TouchWormArena(struct WormArena* arena, int valid, int timeout)
   {
     result = -EPIPE;
     entity = arena->entity;
-    value  = WORM_PEER(hole->identifier, arena->process);
+    value  = WORM_PEER(arena->host, arena->process);
     time   = GetCurrentTime();
 
     if ((atomic_load_explicit(&entity->peer, memory_order_relaxed) == value) &&
@@ -1365,12 +1403,6 @@ int CheckWormArenaDescriptor(struct WormArenaDescriptor* descriptor)
   }
 
   descriptor->revision = revision;
-
-  if (descriptor->change != NULL)
-  {
-    //
-    descriptor->change(descriptor);
-  }
 
   return 1;
 }
@@ -1758,6 +1790,7 @@ struct WormArena* CreateWormArena(struct WormHole* hole, const char* name)
   if (arena = (struct WormArena*)calloc(1, sizeof(struct WormArena)))
   {
     arena->hole     = hole;
+    arena->host     = GetHostIdentifier();
     arena->process  = getpid();
     arena->entities = CreateHashMap(NULL);
     arena->blocks   = CreateHashMap(NULL);
