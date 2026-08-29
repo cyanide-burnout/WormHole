@@ -1186,6 +1186,11 @@ int RegisterWormArenaEntity(struct WormArena* arena, const char* name, int valid
       {
         entity->number = number;
 
+        // The peer says who this is and never changes, the address says where to ring
+        // and is handed out by ivshmem anew on every connection, so it is written
+        // again on every renewal of the lease
+
+        atomic_store_explicit(&entity->address, (uint32_t)hole->identifier, memory_order_relaxed);
         atomic_store_explicit(&entity->peer, WORM_PEER(arena->host, arena->process), memory_order_relaxed);
 
         memset(entity->name, 0, sizeof(entity->name));
@@ -1237,6 +1242,7 @@ int TouchWormArena(struct WormArena* arena, int valid, int timeout)
         (atomic_load_explicit(&entity->time, memory_order_relaxed) >= time))
     {
       // The lease is still valid and belongs to us, so it can be extended
+      atomic_store_explicit(&entity->address, (uint32_t)hole->identifier, memory_order_relaxed);
       atomic_store_explicit(&entity->time, time + (uint64_t)valid * 1000000ULL, memory_order_release);
       result = 0;
     }

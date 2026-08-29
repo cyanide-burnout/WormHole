@@ -133,6 +133,7 @@ struct WormArenaLock
 struct WormArenaEntity
 {
   uint32_t number;                               // Entity number, the same as the slot in the magic
+  ATOMIC(uint32_t) address;                      // Peer ID of ivshmem, where the doorbell of this entity is rung
   ATOMIC(uint64_t) peer;                         // Identity of the machine and the process on it, see WORM_PEER
   ATOMIC(uint64_t) time;                         // Validity time, nanoseconds of CLOCK_REALTIME
   uint64_t reserved[5];                          // Room to grow into, has to be kept zero until it is taken
