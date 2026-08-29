@@ -1,12 +1,14 @@
-FASTRING ?= ../../FastRing/Ring
-WORMHOLE ?= ../Library
+FASTRING ?= ../../../FastRing/Ring
+WORMHOLE ?= ../../Library
+TOOLKIT  ?= ../../../TetraPack/Product/Toolkit
 
 EXECUTABLE := test
 
 DIRECTORIES := \
 	$(FASTRING) \
 	$(WORMHOLE) \
-	$(TRACE)
+	$(TRACE) \
+	$(TOOLKIT)/Common/
 
 LIBRARIES := \
 	pthread
@@ -18,6 +20,9 @@ OBJECTS := \
 	$(FASTRING)/FastRing.o \
 	$(WORMHOLE)/WormHole.o \
 	$(WORMHOLE)/WormLoop.o \
+	$(WORMHOLE)/WormArena.o \
+	$(TOOLKIT)/Common/CRC32C.o \
+	$(TOOLKIT)/Common/HashMap.o \
 	Test.o
 
 ifneq ($(TRACE),)

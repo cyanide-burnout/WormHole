@@ -100,7 +100,7 @@ int main(int count, const char** arguments)
 
   //
 
-  ring       = CreateFastRing(0, NULL, NULL);
+  ring       = CreateFastRing(0);
   loop       = CreateWormLoop(ring, hole);
   descriptor = SetFastRingTimeout(ring, NULL, 5000, TIMEOUT_FLAG_REPEAT, HandleTimeout, hole);
 
@@ -115,7 +115,7 @@ int main(int count, const char** arguments)
   sigaction(SIGQUIT, &action, NULL);
 
   while ((atomic_load_explicit(&state, memory_order_relaxed) == STATE_RUNNING) &&
-         (WaitFastRing(ring, 200, NULL) >= 0));
+         (WaitForFastRing(ring, 200, NULL) >= 0));
 
   SetFastRingTimeout(ring, descriptor, -1, 0, NULL, NULL);
   ReleaseWormLoop(loop);

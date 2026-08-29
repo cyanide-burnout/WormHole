@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SERVER=../../qemu/build/contrib/ivshmem-server/ivshmem-server
+SERVER=../../../qemu/build/contrib/ivshmem-server/ivshmem-server
 
 # mkdir qemu/build && cd qemu/build
 # ../configure && make
@@ -37,8 +37,8 @@ then
     --output /tmp/test.img \
     --root-password password:test \
     --mkdir /opt/WormHole \
-    --copy-in ../:/opt/WormHole/ \
-    --copy-in ../../FastRing/Ring:/opt/WormHole/ \
+    --copy-in ../../:/opt/WormHole/ \
+    --copy-in ../../../FastRing/Ring:/opt/WormHole/ \
     --firstboot-command '/opt/WormHole/guest.sh' \
   && \
   sudo qemu-system-x86_64 \

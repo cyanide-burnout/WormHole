@@ -1,4 +1,8 @@
 .DS_Store
+
+# built tests
+Test/Hole/test
+Test/Arena/arena
 *.o
 *.d
 *.so
