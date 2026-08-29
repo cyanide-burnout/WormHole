@@ -46,6 +46,34 @@ The sweep also runs before a slot is handed out again, so a number never stands 
 two peers at once: whatever the peer that had it was holding is released while the
 number still means that very peer.
 
+## Time
+
+WormArena does not synchronize the clocks of the machines. Leases and lock
+deadlines are absolute times of `CLOCK_REALTIME`, so the clocks of all participants
+have to agree within the error the application can tolerate. A clock ahead can take
+a live peer for one that is gone, and a clock behind can keep the resources of a
+dead peer longer than intended.
+
+How close is close enough follows from two numbers: the validity an entity asks for
+in `RegisterWormArenaEntity`, and the five seconds a lock may go untouched before it
+may be taken over. The clocks have to agree well within the smaller of the two,
+because a disagreement of that order is indistinguishable from a peer that has died
+holding something.
+
+Synchronize the hosts independently of the arena. NTP is sufficient for ordinary
+leases; use PTP where tighter and more predictable agreement is required. When the
+participants are KVM guests, the preferred way to carry the time of a host into
+them is its virtual PTP clock: the `ptp_kvm` driver exposes it as a PHC such as
+`/dev/ptp0`, and `chronyd` or `phc2sys` disciplines the guest `CLOCK_REALTIME` from
+that clock. `kvm-clock` alone is a clocksource, not a wall-clock synchronization
+service.
+
+Guests of one host can all follow that host this way without exchanging time over
+the network. Guests of different physical hosts still depend on those hosts being
+synchronized with one another; virtual PTP then carries the time of each host into
+its guests. Clock synchronization is part of the deployment, not of the
+shared-memory protocol.
+
 ## Locks
 
 `WORM_LOCK_READ` and `WORM_LOCK_WRITE` are the two kinds. A lock is a single word
