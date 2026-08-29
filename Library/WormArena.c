@@ -79,7 +79,10 @@ static int IsEntityAlive(struct WormArena* arena, uint32_t number)
 
   magic = (struct WormArenaMagic*)arena->hole->memory;
 
-  return atomic_load_explicit(&magic->entities[number].time, memory_order_relaxed) >= GetCurrentTime();
+  // Acquire for the same reason as everywhere else: the lease is what registration
+  // publishes last, and whoever trusts it goes on to read the rest of the entity
+
+  return atomic_load_explicit(&magic->entities[number].time, memory_order_acquire) >= GetCurrentTime();
 }
 
 static uint32_t GetCurrentMoment()
@@ -122,9 +125,7 @@ static int SetSpinLock(struct WormArena* arena, struct WormArenaLock* lock, int 
   uint64_t time;
   uint64_t limit;
   uint64_t expectation;
-  struct WormArenaMagic* magic;
 
-  magic = (struct WormArenaMagic*)arena->hole->memory;
   limit = GetCurrentTime() + (uint64_t)timeout * 1000000ULL;
 
   do
@@ -253,24 +254,6 @@ static int RemoveAll(void* key, size_t size, void* data, void* argument1, void* 
   return 1;
 }
 
-static uint64_t GetPoolRevision(struct WormArenaMagic* magic)
-{
-  uint32_t number;
-  uint64_t revision;
-
-  // Any change in any of the pools has to rebuild the map of blocks, and the sum
-  // of the revisions changes whichever of them has been touched
-
-  revision = 0;
-
-  for (number = 0; number < WORM_ARENA_COLLECTIONS; number ++)
-  {
-    revision += atomic_load_explicit(&magic->collections[number].revision, memory_order_relaxed);
-  }
-
-  return revision;
-}
-
 static int TrackCollectionUpdate(struct WormArena* arena, int timeout)
 {
   int result;
@@ -278,12 +261,10 @@ static int TrackCollectionUpdate(struct WormArena* arena, int timeout)
   uint32_t number;
   uint32_t generation;
   uint64_t count;
-  uint64_t time;
-  uint64_t revisions[2];
+  uint64_t revision;
   struct WormHole* hole;
   struct WormArenaMagic* magic;
   struct WormArenaBlock* block;
-  struct WormArenaEntity* entity;
   struct WormArenaCollection* collection;
 
   hole   = arena->hole;
@@ -294,28 +275,12 @@ static int TrackCollectionUpdate(struct WormArena* arena, int timeout)
   {
     pthread_rwlock_wrlock(&arena->lock);
 
-    revisions[0] = atomic_load_explicit(&magic->revision, memory_order_acquire);
-    revisions[1] = GetPoolRevision(magic);
-    time         = GetCurrentTime();
+    // A block coming and going moves the revision of its pool and not this one, so
+    // the traffic of a queue makes nobody rebuild anything
 
-    if (arena->revisions[0] != revisions[0])
-    {
-      IterateThroughHashMap(arena->entities, RemoveAll, NULL, NULL);
+    revision = atomic_load_explicit(&magic->revisions[WORM_REVISION_COLLECTION], memory_order_acquire);
 
-      for (number = 1; number < WORM_ARENA_ENTITIES; number ++)
-      {
-        entity = magic->entities + number;
-
-        if ((atomic_load_explicit(&entity->time, memory_order_relaxed) >= time) &&
-            (length = strlen(entity->name)))
-        {
-          // An entity whose lease has run out is gone, no matter what is left in its slot
-          PutIntoHashMap(arena->entities, entity->name, length, entity);
-        }
-      }
-    }
-
-    if (arena->revisions[1] != revisions[1])
+    if (arena->revision != revision)
     {
       IterateThroughHashMap(arena->blocks, RemoveAll, NULL, NULL);
 
@@ -349,8 +314,7 @@ static int TrackCollectionUpdate(struct WormArena* arena, int timeout)
       }
     }
 
-    arena->revisions[0] = revisions[0];
-    arena->revisions[1] = revisions[1];
+    arena->revision = revision;
 
     pthread_rwlock_unlock(&arena->lock);
     ClearArenaLock(arena, WORM_LOCK_READ, generation);
@@ -386,6 +350,124 @@ struct WormArenaCollection* FindWormArenaCollection(struct WormArena* arena, con
   }
 
   return NULL;
+}
+
+struct WormArenaEntity* FindWormArenaEntity(struct WormArena* arena, const char* name)
+{
+  uint32_t number;
+  uint64_t time;
+  struct WormArenaMagic* magic;
+  struct WormArenaEntity* entity;
+
+  if ((arena == NULL) ||
+      (name  == NULL))
+  {
+    //
+    return NULL;
+  }
+
+  // Sixty three slots are walked rather than indexed on purpose. A map would save a
+  // fraction of a microsecond on a lookup that happens when a peer settles in, and
+  // would have to be told that a lease has run out, which happens with time and moves
+  // no revision at all. What is walked can not go stale
+
+  magic = (struct WormArenaMagic*)arena->hole->memory;
+  time  = GetCurrentTime();
+
+  for (number = 1; number < WORM_ARENA_ENTITIES; number ++)
+  {
+    entity = magic->entities + number;
+
+    // The lease is what registration publishes last, so it is taken with acquire and
+    // everything of the entity is read after it. Taken any other way, the name here
+    // could be the one of a slot that is not filled in yet
+
+    if ((atomic_load_explicit(&entity->time, memory_order_acquire) >= time) &&
+        (strncmp(entity->name, name, sizeof(entity->name)) == 0))
+    {
+      //
+      return entity;
+    }
+  }
+
+  return NULL;
+}
+
+int KickWormArenaEntity(struct WormArena* arena, struct WormArenaEntity* entity)
+{
+  if ((arena  == NULL) ||
+      (entity == NULL))
+  {
+    //
+    return -EINVAL;
+  }
+
+  // The lease is not asked about here on purpose. A bell says no more than look
+  // around, so ringing one that has just gone costs nothing, and neither does ringing
+  // an address that has been handed over to somebody else in the meantime
+
+  return KickWormHole(arena->hole, atomic_load_explicit(&entity->address, memory_order_relaxed));
+}
+
+int KickAllWormArenaEntities(struct WormArena* arena)
+{
+  int count;
+  uint32_t number;
+  uint32_t index;
+  uint32_t address;
+  uint64_t time;
+  struct WormArenaMagic* magic;
+  struct WormArenaEntity* entity;
+
+  if (arena == NULL)
+  {
+    //
+    return -EINVAL;
+  }
+
+  magic = (struct WormArenaMagic*)arena->hole->memory;
+  time  = GetCurrentTime();
+  count = 0;
+
+  for (number = 1; number < WORM_ARENA_ENTITIES; number ++)
+  {
+    entity = magic->entities + number;
+
+    if ((entity == arena->entity) ||
+        (atomic_load_explicit(&entity->time, memory_order_acquire) < time))
+    {
+      // Ourselves, or somebody whose lease has run out and who is not there to hear it
+      continue;
+    }
+
+    // Only after the lease, never before it: an address read out of a slot that is
+    // still being filled in belongs to nobody
+
+    address = atomic_load_explicit(&entity->address, memory_order_relaxed);
+
+    // All the processes of one guest share the single device of it and answer at one
+    // address, so an address already rung is skipped rather than rung once per entity.
+    // Ourselves we skip here as well: we have not been rung either, and taking our own
+    // entity for one that has heard it would leave a neighbour on our machine unrung
+
+    for (index = 1; index < number; index ++)
+    {
+      if ((magic->entities + index != arena->entity)                                            &&
+          (atomic_load_explicit(&magic->entities[index].time, memory_order_acquire) >= time)     &&
+          (atomic_load_explicit(&magic->entities[index].address, memory_order_relaxed) == address))
+      {
+        //
+        break;
+      }
+    }
+
+    if (index == number)
+    {
+      count += (KickWormHole(arena->hole, address) == 0);
+    }
+  }
+
+  return count;
 }
 
 // Blocks
@@ -527,7 +609,7 @@ static void PublishArenaCollection(struct WormArenaMagic* magic, struct WormAren
   // The type is published last, it is what makes the collection a part of the arena
 
   atomic_store_explicit(&collection->type, type, memory_order_release);
-  atomic_fetch_add_explicit(&magic->revision, 1, memory_order_release);
+  atomic_fetch_add_explicit(&magic->revisions[WORM_REVISION_COLLECTION], 1, memory_order_release);
 }
 
 struct WormArenaCollection* CreateWormArenaRegion(struct WormArena* arena, const char* name, uint64_t size, int timeout)
@@ -582,7 +664,6 @@ struct WormArenaCollection* CreateWormArenaRegion(struct WormArena* arena, const
 
 struct WormArenaCollection* CreateWormArenaQueue(struct WormArena* arena, const char* name, uint32_t slots, int timeout)
 {
-  uint32_t number;
   uint32_t generation;
   uint64_t offset;
   uint64_t length;
@@ -715,207 +796,10 @@ struct WormArenaCollection* CreateWormArenaPool(struct WormArena* arena, const c
   return collection;
 }
 
-static struct WormArenaBlock* AllocateBlock(struct WormArena* arena, struct WormArenaCollection* pool, const char* name, uint64_t size, int timeout)
-{
-  uint32_t generation;
-  struct WormHole* hole;
-  struct WormArenaBlock* block;
-  struct WormArenaBlock* result;
-
-  if ((arena         == NULL)                 ||
-      (arena->entity == NULL)                 ||
-      (pool          == NULL)                 ||
-      (pool->type    != WORM_COLLECTION_POOL) ||
-      (size          == 0)                    ||
-      (size          >  pool->length))
-  {
-    // Only a registered entity can own a block, and it has to fit the pool
-    return NULL;
-  }
-
-  hole   = arena->hole;
-  result = NULL;
-
-  if (SetArenaLock(arena, WORM_LOCK_WRITE, timeout, &generation) == 0)
-  {
-    if (block = PopFreeBlock(hole, pool))
-    {
-      memset(block->name, 0, sizeof(block->name));
-
-      if (name != NULL)
-      {
-        // A block carrying a message stays nameless
-        strncpy(block->name, name, sizeof(block->name) - 1);
-      }
-
-      block->size = size;
-
-      ResetSpinLock(&block->lock);
-      atomic_fetch_add_explicit(&block->revision, 1, memory_order_relaxed);
-      atomic_store_explicit(&block->counts[arena->entity->number], 1, memory_order_relaxed);
-
-      // The holder is published last, it is what makes the block taken for everybody else
-      atomic_store_explicit(&block->holders, WORM_HOLDER(arena->entity->number), memory_order_release);
-      atomic_fetch_add_explicit(&pool->revision, 1, memory_order_release);
-
-      result = block;
-    }
-
-    ClearArenaLock(arena, WORM_LOCK_WRITE, generation);
-  }
-
-  return result;
-}
-
-static struct WormArenaBlock* HoldBlock(struct WormArena* arena, struct WormArenaBlock* block)
-{
-  uint32_t number;
-  uint64_t value;
-  struct WormArenaBlock* result;
-
-  if ((arena         == NULL) ||
-      (arena->entity == NULL) ||
-      (block         == NULL))
-  {
-    //
-    return NULL;
-  }
-
-  number = arena->entity->number;
-  result = NULL;
-
-  // The map and the count are two words, so within a process they are moved under
-  // the lock of the arena: otherwise the last release of one thread could free the
-  // block between the exchange below and the count that follows it
-
-  pthread_rwlock_wrlock(&arena->lock);
-
-  value = atomic_load_explicit(&block->holders, memory_order_relaxed);
-
-  while (value != 0)
-  {
-    if (atomic_compare_exchange_weak_explicit(&block->holders, &value, value | WORM_HOLDER(number), memory_order_acquire, memory_order_relaxed))
-    {
-      if (atomic_fetch_add_explicit(&block->counts[number], 1, memory_order_relaxed) != WORM_HOLDER_LIMIT)
-      {
-        //
-        result = block;
-        break;
-      }
-
-      // One entity can not hold one block more times than the count can carry
-      atomic_fetch_sub_explicit(&block->counts[number], 1, memory_order_relaxed);
-      break;
-    }
-  }
-
-  pthread_rwlock_unlock(&arena->lock);
-
-  return result;
-}
-
-static void ReleaseBlock(struct WormArena* arena, struct WormArenaBlock* block)
-{
-  uint32_t number;
-  uint64_t value;
-  struct WormArenaCollection* pool;
-
-  if ((arena         == NULL) ||
-      (arena->entity == NULL) ||
-      (block         == NULL))
-  {
-    //
-    return;
-  }
-
-  number = arena->entity->number;
-
-  pthread_rwlock_wrlock(&arena->lock);
-
-  value = 0;
-
-  if (atomic_fetch_sub_explicit(&block->counts[number], 1, memory_order_release) == 1)
-  {
-    // That was the last hold of ours, so our bit goes out of the map
-    value = atomic_fetch_and_explicit(&block->holders, ~WORM_HOLDER(number), memory_order_release);
-  }
-
-  pthread_rwlock_unlock(&arena->lock);
-
-  if (value != WORM_HOLDER(number))
-  {
-    // We hold the block yet, or somebody else does
-    return;
-  }
-
-  // No lock is taken here on purpose. The free list is a stack of exchanges of its
-  // own, and the block belongs to nobody by now, so its name and size are ours to
-  // clear. Waiting for the lock of the arena would mean losing the block on a timeout
-
-  if (pool = GetBlockPool(arena, block))
-  {
-    memset(block->name, 0, sizeof(block->name));
-
-    block->size = 0;
-
-    PushFreeBlock(arena->hole, pool, block);
-    atomic_fetch_add_explicit(&pool->revision, 1, memory_order_release);
-  }
-}
-
-static int GetBlockNumber(struct WormArena* arena, struct WormArenaBlock* block, uint32_t* collection, uint32_t* number)
-{
-  uint32_t index;
-  struct WormArenaMagic* magic;
-  struct WormArenaCollection* pool;
-
-  if ((arena == NULL) ||
-      (block == NULL) ||
-      ((pool = GetBlockPool(arena, block)) == NULL))
-  {
-    // The block does not belong to any of the pools of this arena
-    return -EINVAL;
-  }
-
-  magic       = (struct WormArenaMagic*)arena->hole->memory;
-  index       = pool - magic->collections;
-  *collection = index;
-  *number     = block - (struct WormArenaBlock*)(arena->hole->memory + pool->offset);
-
-  return 0;
-}
-
-static struct WormArenaBlock* GetBlock(struct WormArena* arena, uint32_t collection, uint32_t number)
-{
-  struct WormArenaMagic* magic;
-  struct WormArenaCollection* pool;
-
-  if ((arena      == NULL) ||
-      (collection == 0)    ||
-      (collection >= WORM_ARENA_COLLECTIONS))
-  {
-    //
-    return NULL;
-  }
-
-  magic = (struct WormArenaMagic*)arena->hole->memory;
-  pool  = magic->collections + collection;
-
-  if ((atomic_load_explicit(&pool->type, memory_order_acquire) != WORM_COLLECTION_POOL) ||
-      (number >= pool->count))
-  {
-    // The numbers come from the shared memory, so they are taken on trust nowhere
-    return NULL;
-  }
-
-  return (struct WormArenaBlock*)(arena->hole->memory + pool->offset) + number;
-}
-
 static int IsBlockQueued(struct WormArena* arena, uint32_t collection, uint32_t block)
 {
   uint32_t number;
   uint64_t count;
-  uint64_t value;
   uint64_t wanted;
   struct WormArenaMagic* magic;
   ATOMIC(uint64_t)* slots;
@@ -1075,12 +959,17 @@ static void SweepArena(struct WormArena* arena)
         {
           // Nothing holds the block any more, so it goes back to the free list of its pool
 
+          if (block->name[0] != '\0')
+          {
+            atomic_fetch_add_explicit(&collection->revision, 1, memory_order_release);
+            atomic_fetch_add_explicit(&magic->revisions[WORM_REVISION_COLLECTION], 1, memory_order_release);
+          }
+
           memset(block->name, 0, sizeof(block->name));
 
           block->size = 0;
 
           PushFreeBlock(hole, collection, block);
-          atomic_fetch_add_explicit(&collection->revision, 1, memory_order_release);
         }
       }
 
@@ -1106,12 +995,17 @@ static void SweepArena(struct WormArena* arena)
       {
         atomic_store_explicit(&block->counts[0], 0, memory_order_relaxed);
 
+        if (block->name[0] != '\0')
+        {
+          atomic_fetch_add_explicit(&collection->revision, 1, memory_order_release);
+          atomic_fetch_add_explicit(&magic->revisions[WORM_REVISION_COLLECTION], 1, memory_order_release);
+        }
+
         memset(block->name, 0, sizeof(block->name));
 
         block->size = 0;
 
         PushFreeBlock(hole, collection, block);
-        atomic_fetch_add_explicit(&collection->revision, 1, memory_order_release);
       }
 
       block ++;
@@ -1123,6 +1017,232 @@ static void SweepArena(struct WormArena* arena)
   pthread_rwlock_unlock(&arena->lock);
 }
 
+static struct WormArenaBlock* AllocateBlock(struct WormArena* arena, struct WormArenaCollection* pool, const char* name, uint64_t size, int timeout)
+{
+  uint32_t generation;
+  struct WormHole* hole;
+  struct WormArenaMagic* magic;
+  struct WormArenaBlock* block;
+  struct WormArenaBlock* result;
+
+  if ((arena         == NULL)                 ||
+      (arena->entity == NULL)                 ||
+      (pool          == NULL)                 ||
+      (pool->type    != WORM_COLLECTION_POOL) ||
+      (size          == 0)                    ||
+      (size          >  pool->length))
+  {
+    // Only a registered entity can own a block, and it has to fit the pool
+    return NULL;
+  }
+
+  hole   = arena->hole;
+  magic  = (struct WormArenaMagic*)hole->memory;
+  result = NULL;
+
+  if (SetArenaLock(arena, WORM_LOCK_WRITE, timeout, &generation) == 0)
+  {
+    block = PopFreeBlock(hole, pool);
+
+    if (block == NULL)
+    {
+      // Out of blocks is the only moment when giving back what the peers that are
+      // gone were holding is worth its price, and the only one that has to pay it
+      // is the one that has run out
+
+      SweepArena(arena);
+
+      block = PopFreeBlock(hole, pool);
+    }
+
+    if (block != NULL)
+    {
+      memset(block->name, 0, sizeof(block->name));
+
+      if (name != NULL)
+      {
+        // A block carrying a message stays nameless
+        strncpy(block->name, name, sizeof(block->name) - 1);
+      }
+
+      block->size = size;
+
+      if (name != NULL)
+      {
+        // Only a named block is ever looked for by name, so only it moves a revision.
+        // A block taken for a message is nameless and lives as long as the message
+        // does, and its coming and going has to cost the neighbours nothing at all
+
+        atomic_fetch_add_explicit(&pool->revision, 1, memory_order_release);
+        atomic_fetch_add_explicit(&magic->revisions[WORM_REVISION_COLLECTION], 1, memory_order_release);
+      }
+
+      ResetSpinLock(&block->lock);
+      atomic_fetch_add_explicit(&block->revision, 1, memory_order_relaxed);
+      atomic_store_explicit(&block->counts[arena->entity->number], 1, memory_order_relaxed);
+
+      // The holder is published last, it is what makes the block taken for everybody else
+      atomic_store_explicit(&block->holders, WORM_HOLDER(arena->entity->number), memory_order_release);
+
+      result = block;
+    }
+
+    ClearArenaLock(arena, WORM_LOCK_WRITE, generation);
+  }
+
+  return result;
+}
+
+static struct WormArenaBlock* HoldBlock(struct WormArena* arena, struct WormArenaBlock* block)
+{
+  uint32_t number;
+  uint64_t value;
+  struct WormArenaBlock* result;
+
+  if ((arena         == NULL) ||
+      (arena->entity == NULL) ||
+      (block         == NULL))
+  {
+    //
+    return NULL;
+  }
+
+  number = arena->entity->number;
+  result = NULL;
+
+  // The map and the count are two words, so within a process they are moved under
+  // the lock of the arena: otherwise the last release of one thread could free the
+  // block between the exchange below and the count that follows it
+
+  pthread_rwlock_wrlock(&arena->lock);
+
+  value = atomic_load_explicit(&block->holders, memory_order_relaxed);
+
+  while (value != 0)
+  {
+    if (atomic_compare_exchange_weak_explicit(&block->holders, &value, value | WORM_HOLDER(number), memory_order_acquire, memory_order_relaxed))
+    {
+      if (atomic_fetch_add_explicit(&block->counts[number], 1, memory_order_relaxed) != WORM_HOLDER_LIMIT)
+      {
+        //
+        result = block;
+        break;
+      }
+
+      // One entity can not hold one block more times than the count can carry
+      atomic_fetch_sub_explicit(&block->counts[number], 1, memory_order_relaxed);
+      break;
+    }
+  }
+
+  pthread_rwlock_unlock(&arena->lock);
+
+  return result;
+}
+
+static void ReleaseBlock(struct WormArena* arena, struct WormArenaBlock* block)
+{
+  uint32_t number;
+  uint64_t value;
+  struct WormArenaCollection* pool;
+
+  if ((arena         == NULL) ||
+      (arena->entity == NULL) ||
+      (block         == NULL))
+  {
+    //
+    return;
+  }
+
+  number = arena->entity->number;
+
+  pthread_rwlock_wrlock(&arena->lock);
+
+  value = 0;
+
+  if (atomic_fetch_sub_explicit(&block->counts[number], 1, memory_order_release) == 1)
+  {
+    // That was the last hold of ours, so our bit goes out of the map
+    value = atomic_fetch_and_explicit(&block->holders, ~WORM_HOLDER(number), memory_order_release);
+  }
+
+  pthread_rwlock_unlock(&arena->lock);
+
+  if (value != WORM_HOLDER(number))
+  {
+    // We hold the block yet, or somebody else does
+    return;
+  }
+
+  // No lock is taken here on purpose. The free list is a stack of exchanges of its
+  // own, and the block belongs to nobody by now, so its name and size are ours to
+  // clear. Waiting for the lock of the arena would mean losing the block on a timeout
+
+  if (pool = GetBlockPool(arena, block))
+  {
+    if (block->name[0] != '\0')
+    {
+      //
+      atomic_fetch_add_explicit(&pool->revision, 1, memory_order_release);
+      atomic_fetch_add_explicit(&((struct WormArenaMagic*)arena->hole->memory)->revisions[WORM_REVISION_COLLECTION], 1, memory_order_release);
+    }
+
+    memset(block->name, 0, sizeof(block->name));
+
+    block->size = 0;
+
+    PushFreeBlock(arena->hole, pool, block);
+  }
+}
+
+static int GetBlockNumber(struct WormArena* arena, struct WormArenaBlock* block, uint32_t* collection, uint32_t* number)
+{
+  uint32_t index;
+  struct WormArenaMagic* magic;
+  struct WormArenaCollection* pool;
+
+  if ((arena == NULL) ||
+      (block == NULL) ||
+      ((pool = GetBlockPool(arena, block)) == NULL))
+  {
+    // The block does not belong to any of the pools of this arena
+    return -EINVAL;
+  }
+
+  magic       = (struct WormArenaMagic*)arena->hole->memory;
+  index       = pool - magic->collections;
+  *collection = index;
+  *number     = block - (struct WormArenaBlock*)(arena->hole->memory + pool->offset);
+
+  return 0;
+}
+
+static struct WormArenaBlock* GetBlock(struct WormArena* arena, uint32_t collection, uint32_t number)
+{
+  struct WormArenaMagic* magic;
+  struct WormArenaCollection* pool;
+
+  if ((arena      == NULL) ||
+      (collection == 0)    ||
+      (collection >= WORM_ARENA_COLLECTIONS))
+  {
+    //
+    return NULL;
+  }
+
+  magic = (struct WormArenaMagic*)arena->hole->memory;
+  pool  = magic->collections + collection;
+
+  if ((atomic_load_explicit(&pool->type, memory_order_acquire) != WORM_COLLECTION_POOL) ||
+      (number >= pool->count))
+  {
+    // The numbers come from the shared memory, so they are taken on trust nowhere
+    return NULL;
+  }
+
+  return (struct WormArenaBlock*)(arena->hole->memory + pool->offset) + number;
+}
+
 int UpdateWormArena(struct WormArena* arena, int timeout)
 {
   if (arena == NULL)
@@ -1131,10 +1251,6 @@ int UpdateWormArena(struct WormArena* arena, int timeout)
     return -EINVAL;
   }
 
-  // Whatever the peers that are gone were holding is given back first, so that the
-  // maps below are built of what is really there
-
-  SweepArena(arena);
 
   // Rebuilds the maps of entities and of named blocks if anything has moved,
   // this is what a peer calls when the bell tells it to look around
@@ -1198,7 +1314,7 @@ int RegisterWormArenaEntity(struct WormArena* arena, const char* name, int valid
 
         // The lease is published last, it makes the entity visible to the peers
         atomic_store_explicit(&entity->time, time + (uint64_t)valid * 1000000ULL, memory_order_release);
-        atomic_fetch_add_explicit(&magic->revision, 1, memory_order_release);
+        atomic_fetch_add_explicit(&magic->revisions[WORM_REVISION_ENTITY], 1, memory_order_release);
 
         arena->entity = entity;
         result        = 0;
@@ -1518,8 +1634,10 @@ int PushWormArenaQueue(struct WormArena* arena, struct WormArenaCollection* queu
 
       if (atomic_compare_exchange_strong_explicit(slot, &token, WORM_SLOT(collection, number), memory_order_release, memory_order_relaxed))
       {
-        //
-        atomic_fetch_add_explicit(&queue->revision, 1, memory_order_relaxed);
+        // Nothing is counted here: a slot carries a block that has no name, so it
+        // changes no set anybody looks things up in, and a consumer learns of the
+        // message from the doorbell and from the slot itself
+
         return 0;
       }
 
@@ -1682,7 +1800,8 @@ static int FormatArena(struct WormHole* hole, const char* name)
   strncpy(magic->name, name, sizeof(magic->name) - 1);
 
   ResetSpinLock(&magic->lock);
-  atomic_store_explicit(&magic->revision, 0, memory_order_relaxed);
+  atomic_store_explicit(&magic->revisions[WORM_REVISION_ENTITY],     0, memory_order_relaxed);
+  atomic_store_explicit(&magic->revisions[WORM_REVISION_COLLECTION], 0, memory_order_relaxed);
 
   return 0;
 }
@@ -1798,13 +1917,11 @@ struct WormArena* CreateWormArena(struct WormHole* hole, const char* name)
     arena->hole     = hole;
     arena->host     = GetHostIdentifier();
     arena->process  = getpid();
-    arena->entities = CreateHashMap(NULL);
     arena->blocks   = CreateHashMap(NULL);
 
     pthread_rwlock_init(&arena->lock, NULL);
 
-    if ((arena->entities == NULL) ||
-        (arena->blocks   == NULL) ||
+    if ((arena->blocks == NULL) ||
         (TrackCollectionUpdate(arena, WORM_ARENA_TIMEOUT) != 0))
     {
       ReleaseWormArena(arena);
@@ -1832,14 +1949,13 @@ void ReleaseWormArena(struct WormArena* arena)
         // Drop the lease right away instead of leaving the slot to the peers to expire
         atomic_store_explicit(&entity->peer, 0, memory_order_relaxed);
         atomic_store_explicit(&entity->time, 0, memory_order_relaxed);
-        atomic_fetch_add_explicit(&magic->revision, 1, memory_order_release);
+        atomic_fetch_add_explicit(&magic->revisions[WORM_REVISION_ENTITY], 1, memory_order_release);
 
         ClearArenaLock(arena, WORM_LOCK_WRITE, generation);
       }
     }
 
     ReleaseHashMap(arena->blocks);
-    ReleaseHashMap(arena->entities);
     pthread_rwlock_destroy(&arena->lock);
     free(arena);
   }

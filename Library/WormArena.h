@@ -71,6 +71,14 @@ extern "C"
 // in a block can address, and the slot number is the identity everywhere else.
 // Slot zero is never handed out, its bit belongs to the queues
 
+// One of these is what the map of the named blocks is rebuilt by, the other the arena
+// does not read at all: it is there for an application that wants to notice a
+// neighbour coming or going by a single load instead of walking the slots
+
+#define WORM_REVISION_ENTITY      0
+#define WORM_REVISION_COLLECTION  1
+#define WORM_REVISION_COUNT       2
+
 #define WORM_ARENA_ENTITIES     64
 #define WORM_ARENA_COLLECTIONS  128
 
@@ -127,55 +135,55 @@ extern "C"
 
 struct WormArenaLock
 {
-  ATOMIC(uint64_t) value;                        // Generation, owner, state and deadline together, see WORM_LOCK
+  ATOMIC(uint64_t) value;                           // Generation, owner, state and deadline together, see WORM_LOCK
 };
 
 struct WormArenaEntity
 {
-  uint32_t number;                               // Entity number, the same as the slot in the magic
-  ATOMIC(uint32_t) address;                      // Peer ID of ivshmem, where the doorbell of this entity is rung
-  ATOMIC(uint64_t) peer;                         // Identity of the machine and the process on it, see WORM_PEER
-  ATOMIC(uint64_t) time;                         // Validity time, nanoseconds of CLOCK_REALTIME
-  uint64_t reserved[5];                          // Room to grow into, has to be kept zero until it is taken
-  char name[64];                                 // Client name
+  uint32_t number;                                  // Entity number, the same as the slot in the magic
+  ATOMIC(uint32_t) address;                         // Peer ID of ivshmem, where the doorbell of this entity is rung
+  ATOMIC(uint64_t) peer;                            // Identity of the machine and the process on it, see WORM_PEER
+  ATOMIC(uint64_t) time;                            // Validity time, nanoseconds of CLOCK_REALTIME
+  uint64_t reserved[5];                             // Room to grow into, has to be kept zero until it is taken
+  char name[64];                                    // Client name
 };
 
 struct WormArenaBlock
 {
-  struct WormArenaLock lock;                     // Spin lock of the data
-  ATOMIC(uint64_t) revision;                     // Revision mark, has to be changed when the data have been changed, doubles as the tag of the free list
-  ATOMIC(uint64_t) holders;                      // Map of holders, the block is free while it is zero
-  ATOMIC(uint64_t) next;                         // Next free block, see WORM_BLOCK
-  uint64_t offset;                               // Offset of data, set once the pool has been created
-  uint64_t size;                                 // Size of the data in use, up to the length of the pool
-  uint64_t reserved[2];                          // Room to grow into, has to be kept zero until it is taken
-  char name[64];                                 // Block name, empty while the block carries a message
-  ATOMIC(uint16_t) counts[WORM_ARENA_ENTITIES];  // Count of the holds of every entity, the map above is the summary of them
+  struct WormArenaLock lock;                        // Spin lock of the data
+  ATOMIC(uint64_t) revision;                        // Revision mark, has to be changed when the data have been changed, doubles as the tag of the free list
+  ATOMIC(uint64_t) holders;                         // Map of holders, the block is free while it is zero
+  ATOMIC(uint64_t) next;                            // Next free block, see WORM_BLOCK
+  uint64_t offset;                                  // Offset of data, set once the pool has been created
+  uint64_t size;                                    // Size of the data in use, up to the length of the pool
+  uint64_t reserved[2];                             // Room to grow into, has to be kept zero until it is taken
+  char name[64];                                    // Block name, empty while the block carries a message
+  ATOMIC(uint16_t) counts[WORM_ARENA_ENTITIES];     // Count of the holds of every entity, the map above is the summary of them
 };
 
 struct WormArenaCollection
 {
-  struct WormArenaLock lock;                     // Region: spin lock of the data
-  ATOMIC(uint64_t) revision;                     // Revision mark, has to be changed when the data have been changed
-  ATOMIC(uint64_t) head;                         // Pool: first free block, see WORM_BLOCK. Queue: position to take from
-  ATOMIC(uint64_t) tail;                         // Queue: position to put to
-  ATOMIC(uint32_t) type;                         // One of WORM_COLLECTION_*, zero while the slot is free
-  uint32_t filler;                               //
-  uint64_t count;                                // Capacity of the table in entries
-  uint64_t length;                               // Pool: size of the data of a single block
-  uint64_t offset;                               // Offset of the whole region of the collection, the table comes first
-  uint64_t size;                                 // Size of that region
-  uint64_t reserved[7];                          // Room to grow into, has to be kept zero until it is taken
-  char name[64];                                 // Collection name
+  struct WormArenaLock lock;                        // Region: spin lock of the data
+  ATOMIC(uint64_t) revision;                        // Revision mark, has to be changed when the data have been changed
+  ATOMIC(uint64_t) head;                            // Pool: first free block, see WORM_BLOCK. Queue: position to take from
+  ATOMIC(uint64_t) tail;                            // Queue: position to put to
+  ATOMIC(uint32_t) type;                            // One of WORM_COLLECTION_*, zero while the slot is free
+  uint32_t filler;                                  //
+  uint64_t count;                                   // Capacity of the table in entries
+  uint64_t length;                                  // Pool: size of the data of a single block
+  uint64_t offset;                                  // Offset of the whole region of the collection, the table comes first
+  uint64_t size;                                    // Size of that region
+  uint64_t reserved[7];                             // Room to grow into, has to be kept zero until it is taken
+  char name[64];                                    // Collection name
 };
 
 struct WormArenaMagic
 {
-  ATOMIC(uint64_t) signature;                    // WORM_ARENA_SIGNATURE once the arena has been laid out
-  ATOMIC(uint64_t) revision;                     // Revision of the entities and of the list of collections
-  struct WormArenaLock lock;                     // Global spin lock
-  uint64_t reserved[5];                          // Room to grow into, has to be kept zero until it is taken
-  char name[64];                                 // Arena name, to tell the region of the application from a foreign one
+  ATOMIC(uint64_t) signature;                       // WORM_ARENA_SIGNATURE once the arena has been laid out
+  ATOMIC(uint64_t) revisions[WORM_REVISION_COUNT];  // Revisions of the entities and of the collections, see WORM_REVISION_*
+  struct WormArenaLock lock;                        // Global spin lock
+  uint64_t reserved[4];                             // Room to grow into, has to be kept zero until it is taken
+  char name[64];                                    // Arena name, to tell the region of the application from a foreign one
   struct WormArenaEntity entities[WORM_ARENA_ENTITIES];
   struct WormArenaCollection collections[WORM_ARENA_COLLECTIONS];
 };
@@ -184,24 +192,23 @@ struct WormArenaMagic
 
 struct WormArena
 {
-  pthread_rwlock_t lock;                         //
-  struct WormHole* hole;                         //
-  struct HashMap* blocks;                        //
-  struct HashMap* entities;                      //
-  struct WormArenaEntity* entity;                // Local entity
-  uint64_t revisions[2];                         // Revisions of each collection
-  uint32_t host;                                 // Identity of this machine, see WORM_PEER
-  pid_t process;                                 // Local Process ID
+  pthread_rwlock_t lock;                            //
+  struct WormHole* hole;                            //
+  struct HashMap* blocks;                           //
+  struct WormArenaEntity* entity;                   // Local entity
+  uint64_t revision;                                // Revision of the collections the map has been built of
+  uint32_t host;                                    // Identity of this machine, see WORM_PEER
+  pid_t process;                                    // Local Process ID
 };
 
 struct WormArenaDescriptor
 {
-  struct WormArena* arena;                       //
-  struct WormArenaBlock* block;                  //
-  uint64_t revision;                             // Revision of the block as of the last look at it
-  uint32_t generation;                           // Generation of the lock while it is held
-  uint32_t state;                                // WORM_LOCK_READ or WORM_LOCK_WRITE while locked, zero otherwise
-  uint8_t* data;                                 // Pointer to the data of the block
+  struct WormArena* arena;                          //
+  struct WormArenaBlock* block;                     //
+  uint64_t revision;                                // Revision of the block as of the last look at it
+  uint32_t generation;                              // Generation of the lock while it is held
+  uint32_t state;                                   // WORM_LOCK_READ or WORM_LOCK_WRITE while locked, zero otherwise
+  uint8_t* data;                                    // Pointer to the data of the block
 };
 
 struct WormArena* CreateWormArena(struct WormHole* hole, const char* name);
@@ -210,6 +217,10 @@ void ReleaseWormArena(struct WormArena* arena);
 int RegisterWormArenaEntity(struct WormArena* arena, const char* name, int valid, int timeout);
 int UpdateWormArena(struct WormArena* arena, int timeout);
 int TouchWormArena(struct WormArena* arena, int valid, int timeout);
+
+struct WormArenaEntity* FindWormArenaEntity(struct WormArena* arena, const char* name);
+int KickWormArenaEntity(struct WormArena* arena, struct WormArenaEntity* entity);
+int KickAllWormArenaEntities(struct WormArena* arena);
 
 struct WormArenaCollection* CreateWormArenaPool(struct WormArena* arena, const char* name, uint32_t blocks, uint64_t size, int timeout);
 struct WormArenaCollection* CreateWormArenaQueue(struct WormArena* arena, const char* name, uint32_t slots, int timeout);

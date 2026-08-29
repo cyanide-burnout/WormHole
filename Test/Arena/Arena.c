@@ -22,6 +22,13 @@
 #define PEERS         4
 
 static int failures = 0;
+static int kicks    = 0;
+
+static int CountKick(struct WormHole* hole, uint32_t identifier)
+{
+  kicks ++;
+  return 0;
+}
 
 static void Check(int condition, const char* format, ...)
 {
@@ -46,6 +53,7 @@ static struct WormHole* MakeHole(uint8_t* memory, size_t length, uint64_t identi
   hole->length     = length;
   hole->identifier = identifier;
   hole->handle     = -1;
+  hole->kick       = CountKick;
 
   return hole;
 }
@@ -213,12 +221,12 @@ static void TestArena(uint8_t* memory)
 
   ReleaseWormArenaDescriptor(descriptor);
 
-  Check(CreateWormArenaDescriptor(arena, single, NULL, 8, ARENA_TIMEOUT) == NULL, "the block is held by a queue that is not there");
-  Check(UpdateWormArena(arena, ARENA_TIMEOUT) == 0, "the arena is swept again");
+  // The only block of the pool is held by a queue no slot stands behind, and the
+  // allocation that runs into an empty pool is the one that pays for collecting it
 
   descriptor = CreateWormArenaDescriptor(arena, single, NULL, 8, ARENA_TIMEOUT);
 
-  Check(descriptor != NULL, "the hold nobody stands behind is collected");
+  Check(descriptor != NULL, "the hold nobody stands behind is collected by whoever runs out");
 
   ReleaseWormArenaDescriptor(descriptor);
   ReleaseWormArena(arena);
@@ -286,9 +294,11 @@ static void TestPeers(uint8_t* memory)
   int status;
   int count;
   int broken;
+  uint64_t time;
   pid_t children[PEERS];
   struct WormHole* hole;
   struct WormArena* arena;
+  struct WormArenaMagic* magic;
   struct WormArenaCollection* queue;
   struct WormArenaDescriptor* descriptor;
 
@@ -342,6 +352,55 @@ static void TestPeers(uint8_t* memory)
     }
 
     Check(count == PEERS, "every peer has left a message, got %d of %d", count, PEERS);
+
+    Check(FindWormArenaEntity(arena, "reader") == arena->entity, "an entity is found with no map to rebuild first");
+    Check(FindWormArenaEntity(arena, "nobody") == NULL, "an entity that is not there is not found");
+    Check(KickAllWormArenaEntities(arena) == 0, "there is nobody to ring at, the peers have deregistered on the way out");
+
+    // The peers are gone, so a couple of neighbours is put in by hand: what is being
+    // tested here is the walk over those that are there, and it has to be the same
+    // walk whatever the peers happened to do on their way out
+
+    magic = (struct WormArenaMagic*)memory;
+    time  = atomic_load(&arena->entity->time);
+
+    strcpy(magic->entities[2].name, "neighbour");
+    strcpy(magic->entities[3].name, "another");
+
+    atomic_store(&magic->entities[2].address, 100);
+    atomic_store(&magic->entities[3].address, 200);
+    atomic_store(&magic->entities[2].time, time);
+    atomic_store(&magic->entities[3].time, time);
+
+    Check(FindWormArenaEntity(arena, "neighbour") == magic->entities + 2, "a neighbour is found by name");
+    Check(KickWormArenaEntity(arena, magic->entities + 2) == 0, "a neighbour is rung at");
+
+    kicks = 0;
+
+    Check(KickAllWormArenaEntities(arena) == 2, "everybody but ourselves is rung at, got %d", kicks);
+
+    // All the processes of one guest answer at one address, and it is rung once
+
+    atomic_store(&magic->entities[3].address, 100);
+
+    kicks = 0;
+
+    Check(KickAllWormArenaEntities(arena) == 1, "an address shared by two entities is rung once, got %d", kicks);
+
+    // A neighbour on our own machine answers at our own address, and we have not been
+    // rung ourselves, so it has to be rung all the same
+
+    atomic_store(&magic->entities[3].address, atomic_load(&arena->entity->address));
+
+    kicks = 0;
+
+    Check(KickAllWormArenaEntities(arena) == 2, "a neighbour sharing our own address is rung, got %d", kicks);
+
+    // A lease runs out with time and moves no revision, so nothing rebuilds the map
+
+    atomic_store(&magic->entities[2].time, 0);
+
+    Check(FindWormArenaEntity(arena, "neighbour") == NULL, "an entity whose lease has run out is not found");
 
     ReleaseWormArena(arena);
   }
@@ -692,6 +751,11 @@ static void TestQueueReuse(uint8_t* memory)
 int main(int count, char** arguments)
 {
   uint8_t* memory;
+
+  // Line buffered on purpose: what has been printed before a crash is the half of the
+  // report that matters most
+
+  setvbuf(stdout, NULL, _IOLBF, 0);
 
   memory = (uint8_t*)mmap(NULL, ARENA_LENGTH, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 

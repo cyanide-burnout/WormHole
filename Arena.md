@@ -35,15 +35,19 @@ at.
 
 A peer keeps its entity alive by calling `TouchWormArena` more often than the
 validity it asked for. Once a lease runs out the entity is gone as far as everybody
-else is concerned, and `UpdateWormArena` gives back what it was holding:
+else is concerned, and a sweep gives back what it was holding:
 
 * the bits and counts of the holders it had, and the blocks that are left with none,
 * the locks it was holding as a writer,
 * the ownership of the slots it has taken in a queue and not filled in, so that the
   consumer that gets there next takes them back.
 
-The sweep also runs before a slot is handed out again, so a number never stands for
-two peers at once: whatever the peer that had it was holding is released while the
+Nobody calls the sweep on purpose. It runs where its price is worth paying and where
+somebody is there to pay it: when an allocation has found the pool empty, and before
+an entity slot is handed out again. The first is the only moment when reclaiming
+memory is worth anything, and the one who has run out is the one who pays. The second
+is a matter of correctness rather than of memory: a number never stands for two peers
+at once, because whatever the peer that had it was holding is released while the
 number still means that very peer.
 
 ## Time
@@ -73,6 +77,41 @@ the network. Guests of different physical hosts still depend on those hosts bein
 synchronized with one another; virtual PTP then carries the time of each host into
 its guests. Clock synchronization is part of the deployment, not of the
 shared-memory protocol.
+
+## Revisions
+
+Three revisions answer three different questions, and none of them answers more than
+one:
+
+| | |
+|---|---|
+| `WormArenaBlock.revision` | the data of this block have changed |
+| `WormArenaCollection.revision` | the named blocks of this pool have changed |
+| `WormArenaMagic.revisions` | the entities, or the collections, of the arena have changed |
+
+The one of a block is what `CheckWormArenaDescriptor` reads, and it is moved by the
+release of a write lock. The one of the collections is what the map of the named
+blocks is rebuilt by. The one of the entities the arena itself does not read at all:
+it is there for an application that wants to notice a neighbour registering or leaving
+by a single load instead of walking the slots.
+
+It says nothing of a peer that has died, though. A lease ends with time and moves
+nothing at all, so a departure nobody announced is not an event: it is seen by
+walking the slots, or not seen until somebody needs what that peer was holding.
+
+Only one thing is indexed, and it is the only one whose count is not bounded by a
+constant: sixty three entities and a hundred and twenty seven collections are walked,
+the named blocks of a pool are not.
+
+**A block with no name moves no revision at all.** Only a named block is ever looked
+for by name, so only a named block changes a set anybody searches. A block taken for
+a message is nameless, lives as long as the message does, and its coming and going
+costs the neighbours nothing — not a rebuild, not even a write into memory that would
+have to be carried between the machines. Pushing into a queue counts nothing either,
+for the same reason: a slot carries a block that has no name.
+
+This is what makes the traffic of a queue free of any bookkeeping, and it is easy to
+undo by adding a counter that looks symmetric.
 
 ## Locks
 
@@ -110,16 +149,38 @@ signature of this version of the layout is refused at once.
 `RegisterWormArenaEntity` takes a slot and publishes a lease of `valid`
 milliseconds. It can be called once per arena.
 
-`UpdateWormArena` sweeps whatever the peers that are gone have left behind and
-rebuilds the maps of the entities and of the named blocks. It has to be called for a
-block created by another peer to be found by name, and it is what a peer calls when
-the doorbell tells it to look around.
+`UpdateWormArena` rebuilds the map the named blocks are looked up through. It has to
+be called for a block of another peer to be found by name, and it costs a comparison
+when nothing has changed. Entities and collections are walked and not indexed, so
+they need none of this.
 
 Every `timeout` is in milliseconds. Creating anything and registering an entity wait
 for the lock of the arena, while `LockWormArenaDescriptor` and `LockWormArenaRegion`
 wait for the lock they are about to take. Releasing waits for nothing at all: giving
 a block back is a matter of exchanges of its own, and a block lost to a timeout would
 be lost for good.
+
+### Entities and the doorbell
+
+```c
+struct WormArenaEntity* FindWormArenaEntity(struct WormArena* arena, const char* name);
+int KickWormArenaEntity(struct WormArena* arena, struct WormArenaEntity* entity);
+int KickAllWormArenaEntities(struct WormArena* arena);
+```
+
+`FindWormArenaEntity` walks the slots and needs nothing rebuilt beforehand. Sixty
+three of them are a fraction of a microsecond, and a walk can not go stale the way an
+index would: a lease ends with time and moves no revision, so nothing would rebuild
+an index at that moment.
+
+`KickWormArenaEntity` asks about no lease at all. A bell says no more than look
+around, so ringing one that has just gone costs nothing, and neither does ringing an
+address handed over to somebody else in the meantime.
+
+`KickAllWormArenaEntities` rings everybody but ourselves and returns how many were
+rung. It rings every address once and not once per entity behind it: all the
+processes of one guest share the single device of it and answer at one address, so
+ringing per entity would wake that guest as many times as it has processes.
 
 ### Collections
 
@@ -226,8 +287,10 @@ no two of them are ever shared between peers.
 
 ## What is not done yet
 
-* The doorbell is not wired to `UpdateWormArena`, so a peer notices the changes of
-  its neighbours only when it asks.
+* The doorbell is not wired to anything, so a peer looks around when it decides to.
+  There is nothing of the arena to call on that path, though: a peer takes what has
+  arrived out of its queues and asks `CheckWormArenaDescriptor` about the objects it
+  holds, and neither of those touches a map.
 * `HandleWormArenaEntityChange` is declared and never called.
 * Collections can not be deleted, and the area of a deleted one would not be reused.
 * Registration does not check whether the name is taken by somebody alive.
