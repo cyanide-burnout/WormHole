@@ -21,7 +21,7 @@ struct Layout
 {
   atomic_uint_least32_t count;
   atomic_uint_least32_t number;
-  uint32_t peers[16];
+  atomic_uint_least32_t peers[16];
   char message[256];
 };
 
@@ -46,6 +46,7 @@ void HandleTimeout(struct FastRingDescriptor* descriptor)
 {
   struct Layout* layout;
   struct WormHole* hole;
+  uint32_t identifier;
   uint32_t number;
 
   hole   = (struct WormHole*)descriptor->closure;
@@ -54,12 +55,17 @@ void HandleTimeout(struct FastRingDescriptor* descriptor)
 
   sprintf(layout->message, "Bell id=%d pid=%d count=%d        ", hole->identifier, getpid(), number);
 
-  number = atomic_load_explicit(&layout->count, memory_order_acquire);
+  number = 16;
 
   while (number > 0)
   {
     number --;
-    KickWormHole(hole, layout->peers[number]);
+
+    if (identifier = atomic_load_explicit(&layout->peers[number], memory_order_acquire))
+    {
+      // A slot carries the identifier increased by one, so that a zero means nobody
+      KickWormHole(hole, identifier - 1);
+    }
   }
 }
 
@@ -71,6 +77,7 @@ int main(int count, const char** arguments)
   struct WormLoop* loop;
   struct sigaction action;
   struct FastRingDescriptor* descriptor;
+  uint32_t number;
 
 #ifdef TRACE
   SetFaultHandler(report, MakeFaultReportPrologue, MakeCXXTraceReport, MakeFaultProcessAbort, NULL);
@@ -95,8 +102,15 @@ int main(int count, const char** arguments)
   //
 
   layout = (struct Layout*)hole->memory;
-  layout->peers[atomic_fetch_add_explicit(&layout->count, 1, memory_order_relaxed) & 15] = hole->identifier;
-  atomic_fetch_and_explicit(&layout->count, 15, memory_order_release);
+  number = atomic_fetch_add_explicit(&layout->count, 1, memory_order_relaxed);
+
+  if (number < 16)
+  {
+    // The count reserves a slot and the slot publishes itself, so that a peer is never
+    // announced before it is written down. The table is only as deep as it is, and a
+    // peer beyond it goes unannounced rather than taking the place of somebody else
+    atomic_store_explicit(&layout->peers[number], hole->identifier + 1, memory_order_release);
+  }
 
   //
 

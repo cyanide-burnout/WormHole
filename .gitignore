@@ -3,6 +3,7 @@
 # built tests
 Test/Hole/test
 Test/Arena/arena
+Test/Smoke/smoke
 *.o
 *.d
 *.so

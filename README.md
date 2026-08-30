@@ -111,6 +111,25 @@ against *ivshmem-server*, `test.sh 2` builds a guest image and boots it with
 *ivshmem-server* is not packaged by Debian and has to be built out of the `contrib/`
 directory of QEMU.
 
+`Test/Smoke` puts the arena over that same real region. Every peer is given the path
+of the socket or of the UIO device, a name of its own, a number of seconds and the
+least number of distinct senders it has to end up hearing from:
+
+```
+cd Test/Smoke
+make && ./smoke /tmp/ivshmem_socket first 30 2
+```
+
+That last number is what keeps the run honest. A peer left alone takes its own
+messages back out of the queue and would otherwise call that a success; asking for
+two makes it say so only if it has reached somebody else.
+
+Whoever gets there first lays the arena out and the rest attach to it by name. Each
+keeps a lease, pushes a message a second through one lock-free queue, takes a handful
+of whatever has arrived and takes the write lock of a shared region in passing. It
+ends by saying what it sent, what it took, whom it heard from and whether the write
+lock was ever missed.
+
 ### What has been run
 
 On 2026-08-30, Debian 13 and kernel 6.12.107 on both sides of the boundary:
@@ -131,10 +150,16 @@ On 2026-08-30, Debian 13 and kernel 6.12.107 on both sides of the boundary:
   revision, which had one per hole: the UIO device supports no NOWAIT reads, so an
   asynchronous read of it is served by a kernel worker, whereas watching the source
   and reading it once ready is not.
+* The arena over that region, six peers of `Test/Smoke` at once — two on the host and
+  two in each of the two virtual machines. One laid it out and five attached to it by
+  name, all six held a lease and took the write lock of the region in turn 176 times
+  without missing it once, and put 176 messages through a single lock-free queue of
+  which 176 came back out: none lost, none twice.
 
-What has not been run: **WormArena** has never seen a real shared region. It is
-covered only by `Test/Arena`, where the memory is ordinary and cacheable and every
-peer is on one machine.
+What has not been run: the ways a peer can die in the middle of something — the
+sweeps that give back its blocks, its locks and the queue slots it took and never
+filled — are covered only by `Test/Arena`, where the memory is ordinary and cacheable
+and the peers are forks of one process.
 
 ## Limits
 
