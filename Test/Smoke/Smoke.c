@@ -69,6 +69,7 @@ struct Context
   uint32_t turns;
   uint32_t missed;
   uint32_t lapsed;
+  uint32_t quiet;
   uint32_t count;
   char sender[SENDERS][64];
 };
@@ -246,8 +247,13 @@ static void HandleTimeout(struct FastRingDescriptor* descriptor)
   if (TouchWormArena(context->arena, ARENA_LEASE, ARENA_TIMEOUT) != 0)
   {
     // An entity whose lease has run out is a dead one as far as everybody else is
-    // concerned, and whatever it was holding is given back under it
+    // concerned, and whatever it was holding is given back under it. Nothing else is
+    // done in its name this round: taking would put its hold on a block, pushing would
+    // claim a slot of a queue by its number, and the region would be locked by a number
+    // that a sweep is free to hand to somebody else
+
     context->lapsed ++;
+    return;
   }
 
   // Taking comes before putting on purpose: a peer that drained right after its own
@@ -264,8 +270,12 @@ static void HandleTimeout(struct FastRingDescriptor* descriptor)
   {
     entity = magic->entities + index;
 
-    if ((atomic_load_explicit(&entity->time, memory_order_acquire) >= time) &&
-        (entity->name[0] != '\0') &&
+    // A neighbour on its way out is alive and still holds what it holds, it is only
+    // not to be given anything new
+
+    if ((atomic_load_explicit(&entity->time, memory_order_acquire) >= time)                          &&
+        (~WORM_ENTITY_STATE(atomic_load_explicit(&entity->state, memory_order_acquire)) & WORM_ENTITY_QUIESCING) &&
+        (entity->name[0] != '\0')                                                                    &&
         (strcmp(entity->name, context->name) != 0))
     {
       // A peer that is there but whose inbox is not laid out yet is simply skipped,
@@ -446,18 +456,16 @@ int main(int count, const char** arguments)
   ReleaseWormLoop(loop);
   ReleaseFastRing(ring);
 
-  // Emptying comes first and the lease is kept alive through all of it. Taking from a
-  // queue puts a hold on the block behind the message, and the hold is put on in the
-  // name of this entity: doing that once the lease has been let go of would leave the
-  // holds of a peer everybody else already counts as dead, for the next sweep to take
-  // back under a descriptor still in hand. The entity dies at ReleaseWormArena and
-  // not a moment sooner
-  //
-  // What arrives between the last take and that moment is not raced for, it is left
-  // where it is, and it holds a block of the pool for as long as it lies there. An
-  // inbox is named after the slot of its owner, and whoever takes the slot next
-  // empties it before doing anything else, so the block is out on loan for a turn of
-  // the wheel rather than gone
+  // The word goes out first and the emptying follows it. Whoever looks at this peer
+  // from now on leaves it alone, and CheckWormArenaQuiescence says when the last of
+  // those who could still have been addressing it has finished the pass it was in --
+  // by the rounds of the others and not by a clock. The lease is held through all of
+  // it: taking from a queue puts a hold on the block behind the message in the name of
+  // this entity, and a hold of a peer everybody else counts as dead is what the next
+  // sweep takes back from under a descriptor still in hand. The entity dies at
+  // ReleaseWormArena and not a moment sooner
+
+  QuiesceWormArena(context.arena, ARENA_TIMEOUT);
 
   pause.tv_sec  = 0;
   pause.tv_nsec = TICK * 1000000L / 4;
@@ -476,6 +484,17 @@ int main(int count, const char** arguments)
 
     TakeInbox(&context);
     TakeQueue(&context, QUEUE_SLOTS);
+
+    if (CheckWormArenaQuiescence(context.arena, ARENA_TIMEOUT) == 0)
+    {
+      // Nobody is addressing this peer any more, so what is in the inbox is all that
+      // will ever be in it
+
+      TakeInbox(&context);
+      context.quiet = 1;
+      break;
+    }
+
     nanosleep(&pause, NULL);
   }
 
@@ -492,12 +511,14 @@ int main(int count, const char** arguments)
   printf("  queue    %u posted, %u taken, %u refused, %u stalled on a claimed slot\n", context.posted, context.shared, context.refused, context.stalled);
   printf("  region   %u turns, %u missed\n", context.turns, context.missed);
   printf("  lease    %u extensions refused\n", context.lapsed);
+  printf("  going    %s\n", context.quiet ? "quiet before leaving" : "still spoken to when it left");
   printf("  bells    %u\n\n", context.bells);
 
   Check(context.posted != 0, "blocks are taken out of the pool and pushed, %u of them", context.posted);
   Check(context.turns  != 0, "the write lock of the region is taken, %u times", context.turns);
   Check(context.missed == 0, "and never missed, %u missed", context.missed);
   Check(context.lapsed == 0, "the lease is held for the whole run, %u extensions refused", context.lapsed);
+  Check(context.quiet  != 0, "the departure is quiet before it is made, nobody left addressing this peer");
 
   // Nobody competes for an inbox, so hearing from every other peer is a matter of the
   // arena working and not of winning a race for the head of a queue somebody shares

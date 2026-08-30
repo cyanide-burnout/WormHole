@@ -439,6 +439,134 @@ static void RunOrphan(uint8_t* memory)
   _exit(0);
 }
 
+// Going away quietly: saying so, and waiting until nobody can be addressing this peer
+// any more without waiting on a clock
+
+static void TestQuiescence(uint8_t* memory)
+{
+  struct WormHole* first;
+  struct WormHole* second;
+  struct WormHole* third;
+  struct WormHole* hole;
+  struct WormArena* leaver;
+  struct WormArena* neighbour;
+  struct WormArena* latecomer;
+  struct WormArena* other;
+  struct WormArenaMagic* magic;
+  uint32_t number;
+  uint64_t value;
+  uint64_t moment;
+  int status;
+
+  printf("quiescence\n");
+
+  first     = MakeHole(memory, ARENA_LENGTH, 1);
+  second    = MakeHole(memory, ARENA_LENGTH, 2);
+  third     = MakeHole(memory, ARENA_LENGTH, 3);
+  leaver    = CreateWormArena(first,  "test");
+  neighbour = CreateWormArena(second, "test");
+
+  RegisterWormArenaEntity(leaver,    "leaver",    ARENA_LEASE, ARENA_TIMEOUT);
+  RegisterWormArenaEntity(neighbour, "neighbour", ARENA_LEASE, ARENA_TIMEOUT);
+
+  Check(CheckWormArenaQuiescence(leaver, ARENA_TIMEOUT) == -EINVAL, "a peer that is staying has nothing to be quiet about");
+  Check(QuiesceWormArena(leaver, ARENA_TIMEOUT) == 0, "a peer says that it is going");
+  Check(WORM_ENTITY_STATE(leaver->entity->state) & WORM_ENTITY_QUIESCING, "and it shows in its own entity");
+
+  // The neighbour was there when the word went out, so the pass it was in may have
+  // read this peer as one to address, and it has to be waited out
+
+  Check(CheckWormArenaQuiescence(leaver, ARENA_TIMEOUT) == -EAGAIN, "a neighbour caught mid-pass is waited for");
+  Check(TouchWormArena(neighbour, ARENA_LEASE, ARENA_TIMEOUT) == 0, "the neighbour finishes its pass");
+  Check(CheckWormArenaQuiescence(leaver, ARENA_TIMEOUT) == 0, "and is waited for no longer");
+
+  // Whoever comes along afterwards has read the word before its first pass and was
+  // never addressing this peer, so it is nobody to wait for
+
+  latecomer = CreateWormArena(third, "test");
+
+  RegisterWormArenaEntity(latecomer, "latecomer", ARENA_LEASE, ARENA_TIMEOUT);
+
+  Check(CheckWormArenaQuiescence(leaver, ARENA_TIMEOUT) == 0, "a peer that came after the word is not waited for");
+
+  // A slot comes back around, and the peer that takes it must not come into the debts
+  // of the one before. The latecomer goes first, to leave the slot of the neighbour
+  // the lowest free one
+
+  ReleaseWormArena(latecomer);
+
+  for (number = 0; number < 5; number ++)
+  {
+    //
+    TouchWormArena(neighbour, ARENA_LEASE, ARENA_TIMEOUT);
+  }
+
+  Check(QuiesceWormArena(leaver, ARENA_TIMEOUT) == 0, "the word goes out with a neighbour of some standing");
+  Check(CheckWormArenaQuiescence(leaver, ARENA_TIMEOUT) == -EAGAIN, "who is waited for");
+
+  number = neighbour->entity->number;
+
+  ReleaseWormArena(neighbour);
+
+  neighbour = CreateWormArena(second, "test");
+
+  RegisterWormArenaEntity(neighbour, "successor", ARENA_LEASE, ARENA_TIMEOUT);
+
+  Check(neighbour->entity->number == number, "the peer after it takes the very same slot");
+  Check(CheckWormArenaQuiescence(leaver, ARENA_TIMEOUT) == 0, "and does not come into the waiting of the one before");
+
+  // The lease is what bounds the waiting: a neighbour that stops touching stops being
+  // waited on, so a peer that has quietly died cannot hold a departure up forever
+
+  Check(QuiesceWormArena(leaver, ARENA_TIMEOUT) == 0, "the word goes out again");
+  Check(CheckWormArenaQuiescence(leaver, ARENA_TIMEOUT) == -EAGAIN, "the neighbour is caught mid-pass once more");
+
+  atomic_store_explicit(&neighbour->entity->time, 0, memory_order_release);
+
+  Check(CheckWormArenaQuiescence(leaver, ARENA_TIMEOUT) == 0, "a neighbour whose lease has run out is not waited for");
+  Check(CheckWormArenaQuiescence(neighbour, ARENA_TIMEOUT) == -EPIPE, "and is told that its own slot is no longer its own");
+
+  // A slot handed on to another process is not to be marked by the peer that used to
+  // hold it, or the word would be taken for the word of whoever is there now. It takes
+  // a process of its own to tell the two apart: what says whose slot it is, here as in
+  // TouchWormArena, is the machine and the process together with the lease
+
+  magic  = (struct WormArenaMagic*)memory;
+  number = neighbour->entity->number;
+
+  if (fork() == 0)
+  {
+    hole  = MakeHole(memory, ARENA_LENGTH, 4);
+    other = CreateWormArena(hole, "test");
+
+    RegisterWormArenaEntity(other, "usurper", ARENA_LEASE, ARENA_TIMEOUT);
+
+    // Gone while still holding it, so that the slot stays taken by another process
+    _exit(other->entity->number != number);
+  }
+
+  wait(&status);
+
+  Check(WIFEXITED(status) && (WEXITSTATUS(status) == 0), "the slot of the peer is handed on to another process");
+  Check(QuiesceWormArena(neighbour, ARENA_TIMEOUT) == -EPIPE, "and the peer that had it cannot mark it");
+  Check((WORM_ENTITY_STATE(magic->entities[number].state) & WORM_ENTITY_QUIESCING) == 0, "so whoever holds it now is not made to look as if it were going");
+
+  // Nor is letting go of an arena a way of putting out whoever holds its old slot now
+
+  value  = atomic_load_explicit(&magic->entities[number].peer, memory_order_relaxed);
+  moment = atomic_load_explicit(&magic->entities[number].time, memory_order_relaxed);
+
+  ReleaseWormArena(neighbour);
+
+  Check(atomic_load_explicit(&magic->entities[number].peer, memory_order_relaxed) == value,  "and letting the arena go does not take the slot from whoever holds it");
+  Check(atomic_load_explicit(&magic->entities[number].time, memory_order_relaxed) == moment, "nor the lease it is holding it by");
+  ReleaseWormArena(leaver);
+
+  free(first);
+  free(second);
+  free(third);
+}
+
 static void TestRecovery(uint8_t* memory)
 {
   int status;
@@ -774,6 +902,10 @@ int main(int count, char** arguments)
   memset(memory, 0, ARENA_LENGTH);
 
   TestRecovery(memory);
+
+  memset(memory, 0, ARENA_LENGTH);
+
+  TestQuiescence(memory);
 
   memset(memory, 0, ARENA_LENGTH);
 

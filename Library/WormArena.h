@@ -65,7 +65,7 @@ extern "C"
 // whenever anything in the structures below moves, so that a peer built against
 // another one refuses the region instead of reading it as its own
 
-#define WORM_ARENA_SIGNATURE  0x314c4f484d524f57ULL  // WORMHOL1
+#define WORM_ARENA_SIGNATURE  0x324c4f484d524f57ULL  // WORMHOL2
 
 // Entities are a fixed part of the magic: their count is what the map of holders
 // in a block can address, and the slot number is the identity everywhere else.
@@ -81,6 +81,21 @@ extern "C"
 
 #define WORM_ARENA_ENTITIES     64
 #define WORM_ARENA_COLLECTIONS  128
+
+// The round of work of an entity and its state live in one word, so that whoever
+// looks at a neighbour reads the two of them together and never the state of one
+// round beside the number of another. The round is bumped by every touch of the
+// lease and counts the passes of work a peer has made; the state says whether it is
+// still to be addressed. An entity that is quiescing is alive and holds what it
+// held, it is only not to be given anything new
+
+#define WORM_ENTITY(round, state)   (((uint64_t)(round) << 8) | ((state) & 0xff))
+#define WORM_ENTITY_ROUND(value)    ((value) >> 8)
+#define WORM_ENTITY_STATE(value)    ((uint32_t)((value) & 0xff))
+#define WORM_ENTITY_ROUND_STEP      WORM_ENTITY(1, 0)
+
+#define WORM_ENTITY_QUIESCING       (1U << 0)
+#define WORM_ROUND_NONE             UINT64_MAX
 
 // Kind of the collection: a pool keeps blocks, a queue keeps references to them,
 // a region is a named piece of memory the arena knows the bounds of and nothing else
@@ -144,7 +159,8 @@ struct WormArenaEntity
   ATOMIC(uint32_t) address;                         // Peer ID of ivshmem, where the doorbell of this entity is rung
   ATOMIC(uint64_t) peer;                            // Identity of the machine and the process on it, see WORM_PEER
   ATOMIC(uint64_t) time;                            // Validity time, nanoseconds of CLOCK_REALTIME
-  uint64_t reserved[5];                             // Room to grow into, has to be kept zero until it is taken
+  ATOMIC(uint64_t) state;                           // Round of work and state of the entity together, see WORM_ENTITY
+  uint64_t reserved[4];                             // Room to grow into, has to be kept zero until it is taken
   char name[64];                                    // Client name
 };
 
@@ -199,6 +215,12 @@ struct WormArena
   uint64_t revision;                                // Revision of the collections the map has been built of
   uint32_t host;                                    // Identity of this machine, see WORM_PEER
   pid_t process;                                    // Local Process ID
+
+  // Where the rounds of the neighbours stood when this peer began to quiesce. A slot
+  // holding WORM_ROUND_NONE is one to pay no attention to: nobody was there, or has
+  // come along since and has therefore never addressed this peer as a taking one
+
+  uint64_t rounds[WORM_ARENA_ENTITIES];
 };
 
 struct WormArenaDescriptor
@@ -217,6 +239,9 @@ void ReleaseWormArena(struct WormArena* arena);
 int RegisterWormArenaEntity(struct WormArena* arena, const char* name, int valid, int timeout);
 int UpdateWormArena(struct WormArena* arena, int timeout);
 int TouchWormArena(struct WormArena* arena, int valid, int timeout);
+
+int QuiesceWormArena(struct WormArena* arena, int timeout);
+int CheckWormArenaQuiescence(struct WormArena* arena, int timeout);
 
 struct WormArenaEntity* FindWormArenaEntity(struct WormArena* arena, const char* name);
 int KickWormArenaEntity(struct WormArena* arena, struct WormArenaEntity* entity);

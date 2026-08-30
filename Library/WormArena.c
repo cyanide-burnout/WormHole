@@ -1243,6 +1243,150 @@ static struct WormArenaBlock* GetBlock(struct WormArena* arena, uint32_t collect
   return (struct WormArenaBlock*)(arena->hole->memory + pool->offset) + number;
 }
 
+int QuiesceWormArena(struct WormArena* arena, int timeout)
+{
+  int result;
+  uint32_t number;
+  uint32_t generation;
+  uint64_t time;
+  uint64_t value;
+  uint64_t round;
+  struct WormArenaMagic* magic;
+  struct WormArenaEntity* entity;
+
+  if ((arena         == NULL) ||
+      (arena->entity == NULL))
+  {
+    // Arena or entity are not registered
+    return -EINVAL;
+  }
+
+  magic  = (struct WormArenaMagic*)arena->hole->memory;
+  result = SetArenaLock(arena, WORM_LOCK_READ, timeout, &generation);
+
+  if (result == 0)
+  {
+    result = -EPIPE;
+    value  = WORM_PEER(arena->host, arena->process);
+    time   = GetCurrentTime();
+
+    // The slot is only ours while the lease is: one that has run out may have been
+    // handed to somebody else by now, and marking it would tell everybody to leave a
+    // peer alone that is nothing of the kind
+
+    if ((atomic_load_explicit(&arena->entity->peer, memory_order_relaxed) == value) &&
+        (atomic_load_explicit(&arena->entity->time, memory_order_relaxed) >= time))
+    {
+      // The state goes up before anything is looked at, so that a round seen afterwards
+      // is a round of a peer that had the chance to see it
+
+      atomic_fetch_or_explicit(&arena->entity->state, WORM_ENTITY_QUIESCING, memory_order_release);
+
+      for (number = 0; number < WORM_ARENA_ENTITIES; number ++)
+      {
+        entity = magic->entities + number;
+        round  = WORM_ROUND_NONE;
+
+        if ((entity != arena->entity) &&
+            (atomic_load_explicit(&entity->time, memory_order_acquire) >= time))
+        {
+          // Somebody who is here now may be in the middle of a pass that read the state
+          // of this peer before it changed, and that pass has to be waited out
+
+          round = WORM_ENTITY_ROUND(atomic_load_explicit(&entity->state, memory_order_acquire));
+        }
+
+        arena->rounds[number] = round;
+      }
+
+      result = 0;
+    }
+
+    ClearArenaLock(arena, WORM_LOCK_READ, generation);
+  }
+
+  return result;
+}
+
+int CheckWormArenaQuiescence(struct WormArena* arena, int timeout)
+{
+  int result;
+  uint32_t number;
+  uint32_t generation;
+  uint64_t time;
+  uint64_t value;
+  struct WormArenaMagic* magic;
+  struct WormArenaEntity* entity;
+
+  if ((arena         == NULL) ||
+      (arena->entity == NULL))
+  {
+    // Arena or entity are not registered
+    return -EINVAL;
+  }
+
+  magic  = (struct WormArenaMagic*)arena->hole->memory;
+  result = SetArenaLock(arena, WORM_LOCK_READ, timeout, &generation);
+
+  if (result != 0)
+  {
+    //
+    return result;
+  }
+
+  time = GetCurrentTime();
+
+  // The lock is what makes these two a pair rather than two readings that may fall on
+  // either side of a slot changing hands: taking one is what registration does. A lease
+  // that has run out takes the slot with it, and what stands there now is somebody
+  // else's business rather than an answer about this peer
+
+  result = -EPIPE;
+
+  if ((atomic_load_explicit(&arena->entity->peer, memory_order_relaxed) == WORM_PEER(arena->host, arena->process)) &&
+      (atomic_load_explicit(&arena->entity->time, memory_order_relaxed) >= time))
+  {
+    result = -EINVAL;
+
+    if (WORM_ENTITY_STATE(atomic_load_explicit(&arena->entity->state, memory_order_relaxed)) & WORM_ENTITY_QUIESCING)
+    {
+      //
+      result = 0;
+    }
+  }
+
+  if (result != 0)
+  {
+    ClearArenaLock(arena, WORM_LOCK_READ, generation);
+    return result;
+  }
+
+  for (number = 0; number < WORM_ARENA_ENTITIES; number ++)
+  {
+    entity = magic->entities + number;
+
+    // A neighbour that has gone since is no longer anybody to wait for: its lease is
+    // what bounds this, and a peer that stops touching stops being waited on
+
+    if ((arena->rounds[number] != WORM_ROUND_NONE) &&
+        (atomic_load_explicit(&entity->time, memory_order_acquire) >= time))
+    {
+      value = WORM_ENTITY_ROUND(atomic_load_explicit(&entity->state, memory_order_acquire));
+
+      if (value <= arena->rounds[number])
+      {
+        // The pass this neighbour was in when the state went up is still going on
+        ClearArenaLock(arena, WORM_LOCK_READ, generation);
+        return -EAGAIN;
+      }
+    }
+  }
+
+  ClearArenaLock(arena, WORM_LOCK_READ, generation);
+
+  return 0;
+}
+
 int UpdateWormArena(struct WormArena* arena, int timeout)
 {
   if (arena == NULL)
@@ -1265,6 +1409,7 @@ int RegisterWormArenaEntity(struct WormArena* arena, const char* name, int valid
   int result;
   uint32_t number;
   uint32_t generation;
+  uint64_t value;
   uint64_t time;
   struct WormHole* hole;
   struct WormArenaMagic* magic;
@@ -1308,6 +1453,18 @@ int RegisterWormArenaEntity(struct WormArena* arena, const char* name, int valid
 
         atomic_store_explicit(&entity->address, (uint32_t)hole->identifier, memory_order_relaxed);
         atomic_store_explicit(&entity->peer, WORM_PEER(arena->host, arena->process), memory_order_relaxed);
+
+        // The round of a slot goes on where the peer before it left off and never back
+        // to nothing. A neighbour that was going away has written down where this slot
+        // stood, and a round starting afresh would leave the newcomer owing it every
+        // pass its predecessor had ever made -- for a departure it could not possibly
+        // have been holding up, having read the word before it drew its first breath.
+        // Only the state is cleared, and the round takes the step that says the slot
+        // has changed hands
+
+        value = atomic_load_explicit(&entity->state, memory_order_relaxed);
+
+        atomic_store_explicit(&entity->state, WORM_ENTITY(WORM_ENTITY_ROUND(value) + 1, 0), memory_order_relaxed);
 
         memset(entity->name, 0, sizeof(entity->name));
         strncpy(entity->name, name, sizeof(entity->name) - 1);
@@ -1357,8 +1514,12 @@ int TouchWormArena(struct WormArena* arena, int valid, int timeout)
     if ((atomic_load_explicit(&entity->peer, memory_order_relaxed) == value) &&
         (atomic_load_explicit(&entity->time, memory_order_relaxed) >= time))
     {
-      // The lease is still valid and belongs to us, so it can be extended
+      // The lease is still valid and belongs to us, so it can be extended. The round
+      // goes up with it: a touch is what a peer does between one pass of its work and
+      // the next, and that is what makes it a mark a departing neighbour can wait on
+
       atomic_store_explicit(&entity->address, (uint32_t)hole->identifier, memory_order_relaxed);
+      atomic_fetch_add_explicit(&entity->state, WORM_ENTITY_ROUND_STEP, memory_order_release);
       atomic_store_explicit(&entity->time, time + (uint64_t)valid * 1000000ULL, memory_order_release);
       result = 0;
     }
@@ -1946,10 +2107,20 @@ void ReleaseWormArena(struct WormArena* arena)
 
       if (SetArenaLock(arena, WORM_LOCK_WRITE, WORM_ARENA_TIMEOUT, &generation) == 0)
       {
-        // Drop the lease right away instead of leaving the slot to the peers to expire
-        atomic_store_explicit(&entity->peer, 0, memory_order_relaxed);
-        atomic_store_explicit(&entity->time, 0, memory_order_relaxed);
-        atomic_fetch_add_explicit(&magic->revisions[WORM_REVISION_ENTITY], 1, memory_order_release);
+        // Only if the slot is still ours. A lease that ran out while this peer was not
+        // looking may have been handed to somebody else, and letting go of it then would
+        // put out a peer that is very much alive. The two are read under the lock that
+        // registration takes, so they are a pair and not two readings that may fall on
+        // either side of the slot changing hands
+
+        if ((atomic_load_explicit(&entity->peer, memory_order_relaxed) == WORM_PEER(arena->host, arena->process)) &&
+            (atomic_load_explicit(&entity->time, memory_order_relaxed) >= GetCurrentTime()))
+        {
+          // Drop the lease right away instead of leaving the slot to the peers to expire
+          atomic_store_explicit(&entity->peer, 0, memory_order_relaxed);
+          atomic_store_explicit(&entity->time, 0, memory_order_relaxed);
+          atomic_fetch_add_explicit(&magic->revisions[WORM_REVISION_ENTITY], 1, memory_order_release);
+        }
 
         ClearArenaLock(arena, WORM_LOCK_WRITE, generation);
       }

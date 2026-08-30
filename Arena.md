@@ -128,6 +128,67 @@ Blocks are locked through their descriptor, regions directly. Pools and queues h
 no lock of their own: the tables of a pool are lists of exchanges, and a queue is
 lock-free by design.
 
+### Going away quietly
+
+A peer that vanishes is dealt with by the sweep, and that is enough for correctness.
+It is not enough for tidiness: between the last time a departing peer takes from its
+queues and the moment its lease goes, a neighbour that decided to address it a
+moment earlier can still put something there, and what is left standing in a slot
+holds the block behind it.
+
+`QuiesceWormArena` is how a peer says that it is going while it is still there. The
+entity stays alive and goes on holding what it holds; it is only not to be addressed
+any more, and everybody who looks at it sees so. What that does not settle by itself
+is the neighbour that read the entity a moment before the word went out and is only
+now getting round to acting on it.
+
+That is what the round is for. Every touch of the lease bumps it, so it counts the
+passes of work a peer has made, and it sits in the same word as the state so that the
+two are read together. `QuiesceWormArena` writes down where the rounds of the others
+stood, and `CheckWormArenaQuiescence` answers `-EAGAIN` until every one of them has
+moved on: a neighbour whose round has advanced has begun a pass since the word went
+out and has therefore read it. Nobody waits on a clock.
+
+Two things bound the waiting rather than a timeout. A neighbour that appears after
+the word never saw the peer as one to address and is not waited for at all. A
+neighbour that stops touching stops being waited for the moment its lease runs out,
+so a peer that has quietly died cannot hold a departure up for good.
+
+This asks one thing of the application in return: whatever it addresses to another
+peer, it addresses between two touches of its own lease. A loop that keeps its lease
+where it does its work does this already.
+
+```c
+int result;
+
+if (QuiesceWormArena(arena, timeout) == 0)
+{
+  // Waiting is what -EAGAIN means and nothing else does. Every other answer is an
+  // answer rather than a delay, and going round again on one would be going round
+  // forever: -EPIPE says the lease has gone and the slot with it, and nothing is to
+  // be done in the name of an entity that is somebody else's by now
+
+  while ((result = CheckWormArenaQuiescence(arena, timeout)) == -EAGAIN)
+  {
+    if (TouchWormArena(arena, valid, timeout) != 0)
+    {
+      // The lease could not be held, so this peer is a dead one to everybody else
+      break;
+    }
+
+    TakeWhateverHasArrived();
+  }
+
+  if (result == 0)
+  {
+    // Nobody is addressing this peer any more, so what has arrived is all there is
+    TakeWhateverHasArrived();
+  }
+}
+
+ReleaseWormArena(arena);
+```
+
 ## Interface
 
 ### Arena
@@ -139,6 +200,9 @@ void ReleaseWormArena(struct WormArena* arena);
 int RegisterWormArenaEntity(struct WormArena* arena, const char* name, int valid, int timeout);
 int TouchWormArena(struct WormArena* arena, int valid, int timeout);
 int UpdateWormArena(struct WormArena* arena, int timeout);
+
+int QuiesceWormArena(struct WormArena* arena, int timeout);
+int CheckWormArenaQuiescence(struct WormArena* arena, int timeout);
 ```
 
 `CreateWormArena` lays the arena out if the region is untouched and attaches to it
@@ -148,6 +212,14 @@ signature of this version of the layout is refused at once.
 
 `RegisterWormArenaEntity` takes a slot and publishes a lease of `valid`
 milliseconds. It can be called once per arena.
+
+`QuiesceWormArena` says that this peer is going and is not to be addressed any more.
+`CheckWormArenaQuiescence` answers zero once nobody can still be addressing it,
+`-EAGAIN` while somebody can, and `-EINVAL` for a peer that has not said it is going.
+Both answer `-EPIPE` when the lease has run out and the slot may have been handed on:
+a peer that gets it is no longer the one it thinks it is, and is to stop rather than
+to try again. `ReleaseWormArena` is silent about the same thing and simply leaves a
+slot that is no longer its own alone. See *Going away quietly*.
 
 `UpdateWormArena` rebuilds the map the named blocks are looked up through. It has to
 be called for a block of another peer to be found by name, and it costs a comparison
@@ -262,6 +334,8 @@ lays it out, zeroes it once and never looks into it again.
 ## Rules
 
 * One entity per arena per process, registered once and kept alive by `TouchWormArena`.
+* Whatever is addressed to another peer is addressed between two touches of one's own
+  lease, so that a peer on its way out can tell when nobody is addressing it any more.
 * The lock of a block goes before its reference: unlock the descriptor, then release it.
 * Nothing is to be waited for inside the callback of the doorbell: the loop is not
   running while the callback is.
