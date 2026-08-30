@@ -1,0 +1,484 @@
+#!/bin/bash
+#
+# Instance control for ivshmem-server@.service.
+#
+#   ivshmem-server-ctl add <name> [options]   create an instance and start it
+#   ivshmem-server-ctl remove <name> [--purge]
+#   ivshmem-server-ctl list
+#   ivshmem-server-ctl path <name>            print the socket of an instance
+#
+# The remaining verbs -- exec, ready, clean -- are what the unit calls and are
+# of no use by hand.
+
+set -euo pipefail
+
+PREFIX=/usr/local
+
+CONFDIR=/etc/ivshmem-server
+RUNDIR=/run/ivshmem-server
+SERVER=$PREFIX/bin/ivshmem-server
+UNIT=ivshmem-server
+
+fail() { echo "ivshmem-server-ctl: $*" >&2; exit 1; }
+
+# --- instance configuration ------------------------------------------------
+
+# Every value the unit needs comes from one file, so that editing an instance is
+# editing a file and nothing else knows better.
+#
+# The file looks like shell and is not read as shell. Sourcing it would run
+# whatever it holds before anything could be said about it, and a check that
+# comes after the execution is a check of what is left rather than of what was
+# done -- so the settings are parsed out by hand, and a line that is not a plain
+# KEY=value of a name we know stops the instance instead of running.
+parse()
+{
+  local file=$1 line key value
+
+  [ -f "$file" ] || fail "no such file: $file"
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
+
+    case $line in ''|'#'*) continue ;; esac
+
+    key=${line%%=*}
+    value=${line#*=}
+    [ "$key" = "$line" ] && fail "$file: not a KEY=value line: $line"
+
+    key=${key%"${key##*[![:space:]]}"}
+    value=${value#"${value%%[![:space:]]*}"}
+
+    case $value in
+      \'*\') value=${value#\'}; value=${value%\'} ;;
+      \"*\") value=${value#\"}; value=${value%\"} ;;
+    esac
+
+    case $key in
+      SOCKET)        SOCKET=$value ;;
+      SIZE)          SIZE=$value ;;
+      VECTORS)       VECTORS=$value ;;
+      SHM)           SHM=$value ;;
+      DIRECTORY)     DIRECTORY=$value ;;
+      OWNER)         OWNER=$value ;;
+      GROUP)         GROUP=$value ;;
+      MODE)          MODE=$value ;;
+      VERBOSE)       VERBOSE=$value ;;
+      CLEAN_SHM)     CLEAN_SHM=$value ;;
+      READY_TIMEOUT) READY_TIMEOUT=$value ;;
+      *)             fail "$file: not a setting of an instance: $key" ;;
+    esac
+  done < "$file"
+}
+
+defaults()
+{
+  SOCKET=$RUNDIR/$1.sock
+  SIZE=16M
+  VECTORS=1
+  SHM=ivshmem-$1
+  DIRECTORY=
+  OWNER=
+  GROUP=
+  MODE=0660
+  VERBOSE=no
+  CLEAN_SHM=yes
+  READY_TIMEOUT=10
+}
+
+load()
+{
+  local name=$1
+
+  defaults "$name"
+  [ -f "$CONFDIR/$name.conf" ] || fail "no such instance: $name"
+  parse "$CONFDIR/$name.conf"
+
+  check_loaded
+}
+
+check_name()
+{
+  case $1 in
+    ""|*[!A-Za-z0-9_.-]*|.*|-*) fail "bad instance name: ${1:-<empty>}" ;;
+  esac
+}
+
+# The configuration of an instance is a file root reads with . -- so every value
+# that reaches it has to be a value and not a piece of shell. These are the only
+# shapes any of them is allowed to have, checked on the way in and again on the
+# way out.
+check_value()
+{
+  local kind=$1 value=$2
+
+  case $kind in
+    socket|directory)
+      case $value in
+        /*) [[ $value =~ ^/[A-Za-z0-9_./+-]*$ ]] || fail "bad $kind: $value" ;;
+        *)  fail "bad $kind, wants an absolute path: $value" ;;
+      esac ;;
+    size)
+      [[ $value =~ ^[0-9]+[KkMmGg]?$ ]] || fail "bad size: $value" ;;
+    vectors)
+      [[ $value =~ ^[0-9]+$ ]] && [ "$value" -ge 1 ] && [ "$value" -le 64 ] || \
+        fail "bad number of vectors, wants 1 to 64: $value" ;;
+    shm)
+      [[ $value =~ ^/?[A-Za-z0-9_.+-]+$ ]] || fail "bad shm name: $value" ;;
+    owner|group)
+      [[ $value =~ ^[A-Za-z0-9_.-]+$ ]] || fail "bad $kind: $value" ;;
+    mode)
+      [[ $value =~ ^0?[0-7][0-7][0-7]$ ]] || fail "bad mode: $value" ;;
+    yesno)
+      case $value in yes|no) ;; *) fail "wants yes or no, not: $value" ;; esac ;;
+    timeout)
+      [[ $value =~ ^[0-9]+$ ]] && [ "$value" -ge 1 ] || fail "bad timeout: $value" ;;
+  esac
+}
+
+# what load() has just read, before any of it is passed to anything
+check_loaded()
+{
+  check_value socket  "$SOCKET"
+  check_value size    "$SIZE"
+  check_value vectors "$VECTORS"
+  check_value mode    "$MODE"
+  check_value yesno   "$VERBOSE"
+  check_value yesno   "$CLEAN_SHM"
+  check_value timeout "$READY_TIMEOUT"
+  [ -n "$DIRECTORY" ] && check_value directory "$DIRECTORY"
+  [ -z "$DIRECTORY" ] && check_value shm       "$SHM"
+  [ -n "$OWNER" ]     && check_value owner     "$OWNER"
+  [ -n "$GROUP" ]     && check_value group     "$GROUP"
+  return 0
+}
+
+# The path of the POSIX object -M names, as shm_open would open it -- and only
+# when -M is what the instance uses at all. With DIRECTORY set the region is a
+# file mkstemp made and unlinked in that directory, SHM names nothing, and the
+# name it happens to hold is as likely as not to be a neighbour's live region.
+shm_file()
+{
+  [ -z "${DIRECTORY:-}" ] || return 1
+  [ -n "${SHM:-}" ]       || return 1
+  echo "/dev/shm/${SHM#/}"
+}
+
+# Nothing else may be listening where we are about to bind: the server does not
+# unlink a stale socket and would only say "cannot bind". Not being able to ask
+# is its own answer -- "free" would have us unlink a socket somebody is serving.
+#
+#   0  somebody is listening      1  nothing is      2  no way to tell
+#
+# ss failing is not the same answer as ss saying nothing, and neither is ss
+# saying nothing at all: on a host running systemd there are listening unix
+# sockets, so an empty listing means the question did not get through rather
+# than that the socket is dead.
+listened()
+{
+  local listing
+
+  command -v ss >/dev/null 2>&1 || return 2
+  listing=$(ss -lxH 2>/dev/null) || return 2
+  [ -n "$listing" ] || return 2
+
+  # matched in the shell and not through a pipe: grep -q stops at the first hit
+  # and the writer behind it dies of SIGPIPE, which pipefail would then hand
+  # back as the status of a pipeline that had in fact found the socket
+  case $listing in
+    *" $1 "*) return 0 ;;
+  esac
+  return 1
+}
+
+# --- verbs the unit calls --------------------------------------------------
+
+do_exec()
+{
+  local name=$1 arguments state
+  load "$name"
+
+  [ -x "$SERVER" ] || fail "$SERVER is not there"
+
+  mkdir -p "$(dirname "$SOCKET")"
+
+  if [ -e "$SOCKET" ]; then
+    state=0
+    listened "$SOCKET" || state=$?
+    case $state in
+      0) fail "$SOCKET is already being listened on" ;;
+      2) fail "$SOCKET is there and ss is missing or would not answer, so what" \
+              "is serving it cannot be told; install iproute2, or take the" \
+              "socket away by hand once you are sure nothing is" ;;
+      *) rm -f "$SOCKET" ;;
+    esac
+  fi
+
+  arguments=(-F -S "$SOCKET" -l "$SIZE" -n "$VECTORS")
+  if [ -n "$DIRECTORY" ]
+    then arguments+=(-m "$DIRECTORY")
+    else arguments+=(-M "$SHM")
+  fi
+  [ "$VERBOSE" = yes ] && arguments+=(-v)
+
+  exec "$SERVER" "${arguments[@]}"
+}
+
+# The socket appears a moment after the process does, and systemd would call the
+# unit started before then. Holding the start until it is there is what lets the
+# libvirt hook simply start the unit and go on to spawn QEMU.
+do_ready()
+{
+  local name=$1 waited=0
+  load "$name"
+
+  while [ ! -S "$SOCKET" ]; do
+    waited=$((waited + 1))
+    [ "$waited" -gt $((READY_TIMEOUT * 10)) ] && fail "$SOCKET did not appear in ${READY_TIMEOUT}s"
+    sleep 0.1
+  done
+
+  # bound with the umask of the unit, which leaves it writable by root alone,
+  # and connecting to a socket takes write permission
+  [ -n "$OWNER" ] && chown "$OWNER" "$SOCKET"
+  [ -n "$GROUP" ] && chgrp "$GROUP" "$SOCKET"
+  chmod "$MODE" "$SOCKET"
+  return 0
+}
+
+do_clean()
+{
+  local name=$1 file state
+  [ -f "$CONFDIR/$name.conf" ] || return 0
+  load "$name"
+
+  # only one that is certainly nobody's
+  if [ -e "$SOCKET" ]; then
+    state=0
+    listened "$SOCKET" || state=$?
+    if [ "$state" = 1 ]; then rm -f "$SOCKET"; fi
+  fi
+
+  # the server unlinks the object itself when it is let go; this is for the
+  # times it was not, so that the next start does not inherit a used region
+  if [ "$CLEAN_SHM" = yes ] && file=$(shm_file); then
+    rm -f "$file"
+  fi
+  return 0
+}
+
+# --- verbs for people ------------------------------------------------------
+
+# libvirt runs QEMU as libvirt-qemu:kvm on Debian and as qemu:qemu on Fedora;
+# either way the socket has to be reachable by that group.
+default_group()
+{
+  local group
+  for group in kvm qemu libvirt-qemu; do
+    getent group "$group" >/dev/null && { echo "$group"; return; }
+  done
+  echo root
+}
+
+do_add()
+{
+  local name=$1; shift
+  local socket= size=16M vectors=1 shm= directory= owner= group= mode=0660
+  local verbose=no force=no start=yes
+
+  check_name "$name"
+
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --socket)    socket=$2;    shift 2 ;;
+      --size)      size=$2;      shift 2 ;;
+      --vectors)   vectors=$2;   shift 2 ;;
+      --shm)       shm=$2;       shift 2 ;;
+      --directory) directory=$2; shift 2 ;;
+      --owner)     owner=$2;     shift 2 ;;
+      --group)     group=$2;     shift 2 ;;
+      --mode)      mode=$2;      shift 2 ;;
+      --verbose)   verbose=yes;  shift ;;
+      --force)     force=yes;    shift ;;
+      --no-start)  start=no;     shift ;;
+      *) fail "unknown option: $1" ;;
+    esac
+  done
+
+  : "${socket:=$RUNDIR/$name.sock}"
+  : "${shm:=ivshmem-$name}"
+  : "${group:=$(default_group)}"
+
+  # nothing goes into the file before it is known to be a value and not shell
+  check_value socket  "$socket"
+  check_value size    "$size"
+  check_value vectors "$vectors"
+  check_value shm     "$shm"
+  check_value mode    "$mode"
+  [ -n "$directory" ] && check_value directory "$directory"
+  [ -n "$owner" ]     && check_value owner     "$owner"
+  [ -n "$group" ]     && check_value group     "$group"
+
+  [ -e "$CONFDIR/$name.conf" ] && [ "$force" = no ] && \
+    fail "instance $name already exists, --force to overwrite it"
+
+  # two instances on one socket, or on one region, are one instance twice over
+  local other
+  for other in "$CONFDIR"/*.conf; do
+    [ -e "$other" ] || continue
+    [ "$other" = "$CONFDIR/$name.conf" ] && continue
+    # parsed, not sourced, and not checked either: a neighbour written by an
+    # older version is still a neighbour whose socket is taken
+    ( defaults "$(basename "$other" .conf)"
+      parse "$other"
+      [ "$SOCKET" = "$socket" ] && fail "$socket is taken by $(basename "$other" .conf)"
+      [ -z "$directory" ] && [ -z "$DIRECTORY" ] && [ "$SHM" = "$shm" ] && \
+        fail "shm object $shm is taken by $(basename "$other" .conf)"
+      exit 0 ) || exit 1
+  done
+
+  install -d -m 0755 "$CONFDIR"
+
+  # written under a name of its own and moved into place, so that the file root
+  # reads back is never for a moment more readable or more writable than this
+  # says -- cat alone would have left that to the umask of whoever ran the add
+  local temporary
+  temporary=$(mktemp "$CONFDIR/.$name.XXXXXX")
+  cat > "$temporary" <<EOF
+# ivshmem-server instance "$name"
+#
+# systemctl restart $UNIT@$name  gives out a new region: whatever is attached to
+# the old one keeps its mapping and stops hearing anybody.
+
+# Read by the instance a line at a time and never sourced, so what is written
+# here is KEY=value of a name it knows and nothing else.
+
+SOCKET='$socket'
+
+# rounded up to a power of two, because that is what a PCI BAR can be;
+# suffixes K, M and G are understood
+SIZE='$size'
+
+# one is the only value the UIO driver can make use of, 64 the most the server
+# will take
+VECTORS='$vectors'
+
+# POSIX object to keep the region in, taken as /dev/shm/<name>
+SHM='$shm'
+
+# a directory to take the region from instead -- hugetlbfs, say -- in which case
+# the file is unlinked as soon as it is created and SHM above is not used
+DIRECTORY='$directory'
+
+# who gets to connect: the socket is bound owned by root and unreachable by
+# anybody else until this is applied
+OWNER='$owner'
+GROUP='$group'
+MODE='$mode'
+
+# every peer coming and going, into the journal
+VERBOSE='$verbose'
+
+# remove a region left behind by a server that was killed rather than stopped
+CLEAN_SHM='yes'
+EOF
+
+  chmod 0644 "$temporary"
+  mv "$temporary" "$CONFDIR/$name.conf"
+
+  echo "instance $name written to $CONFDIR/$name.conf"
+
+  if [ "$start" = yes ]; then
+    systemctl daemon-reload
+    systemctl enable "$UNIT@$name"
+    # enable --now would have left a running instance running on the old file
+    if systemctl is-active --quiet "$UNIT@$name"; then
+      echo "restarting $UNIT@$name: what it hands out is a new region, and"
+      echo "whatever is attached to the old one stops hearing anybody"
+      systemctl restart "$UNIT@$name"
+    else
+      systemctl start "$UNIT@$name"
+    fi
+    systemctl --no-pager --lines=0 status "$UNIT@$name" || true
+  else
+    echo "start it with: systemctl enable --now $UNIT@$name"
+    echo "or, if it is already running on the previous file: systemctl restart $UNIT@$name"
+  fi
+}
+
+do_remove()
+{
+  local name=$1; shift
+  local purge=no
+  check_name "$name"
+
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --purge) purge=yes; shift ;;
+      *) fail "unknown option: $1" ;;
+    esac
+  done
+
+  systemctl disable --now "$UNIT@$name" 2>/dev/null || true
+
+  if [ "$purge" = yes ]; then
+    rm -f "$CONFDIR/$name.conf"
+    echo "instance $name removed"
+  else
+    echo "instance $name stopped and disabled; $CONFDIR/$name.conf kept, --purge to drop it"
+  fi
+}
+
+do_list()
+{
+  local file name state
+  printf '%-16s %-10s %-34s %-8s %s\n' NAME STATE SOCKET SIZE VECTORS
+  for file in "$CONFDIR"/*.conf; do
+    [ -e "$file" ] || { echo "(no instances)"; return; }
+    name=$(basename "$file" .conf)
+    state=$(systemctl is-active "$UNIT@$name" 2>/dev/null || true)
+    # one file nobody can make sense of is not a reason to stop naming the rest
+    ( load "$name"
+      printf '%-16s %-10s %-34s %-8s %s\n' "$name" "${state:-unknown}" "$SOCKET" "$SIZE" "$VECTORS" ) || \
+      printf '%-16s %-10s %s\n' "$name" "${state:-unknown}" "(unreadable, see above)"
+  done
+}
+
+do_path()
+{
+  check_name "$1"
+  load "$1"
+  echo "$SOCKET"
+}
+
+# --- ---------------------------------------------------------------------
+
+usage()
+{
+  cat <<EOF
+Usage: ivshmem-server-ctl <verb> [arguments]
+
+  add <name> [--socket P] [--size S] [--vectors N] [--shm NAME]
+             [--directory D] [--owner U] [--group G] [--mode M]
+             [--verbose] [--force] [--no-start]
+  remove <name> [--purge]
+  list
+  path <name>
+
+The remaining verbs -- exec, ready, clean -- are what the unit calls and are of
+no use by hand.
+EOF
+  exit "${1:-0}"
+}
+
+[ $# -ge 1 ] || usage 1
+verb=$1; shift
+
+case $verb in
+  add|remove|path)  [ $# -ge 1 ] || fail "$verb needs an instance name"; "do_$verb" "$@" ;;
+  exec|ready|clean) [ $# -eq 1 ] || fail "$verb needs an instance name"; "do_$verb" "$1" ;;
+  list)             do_list ;;
+  -h|--help|help)   usage ;;
+  *)                fail "unknown verb: $verb" ;;
+esac

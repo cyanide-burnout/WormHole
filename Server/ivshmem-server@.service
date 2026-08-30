@@ -1,0 +1,34 @@
+[Unit]
+Description=ivshmem server, instance %i
+Documentation=https://www.qemu.org/docs/master/system/devices/ivshmem.html
+ConditionPathExists=/etc/ivshmem-server/%i.conf
+
+# QEMU connects to the socket while the device is being realized and is not made
+# to wait for it: a domain started before its server is up fails to start at all.
+# This orders the instance ahead of the daemons that autostart domains at boot;
+# domains started later are covered by the libvirt hook, see Server/libvirt-hook.
+Before=libvirtd.service virtqemud.service libvirt-guests.service
+
+[Service]
+Type=exec
+ExecStart=/usr/local/sbin/ivshmem-server-ctl exec %i
+ExecStartPost=/usr/local/sbin/ivshmem-server-ctl ready %i
+ExecStopPost=/usr/local/sbin/ivshmem-server-ctl clean %i
+
+# A restart hands out a new region: the server unlinks the shared object as it
+# goes down, and neither a guest nor a host client reconnects on its own. Coming
+# back up silently would leave everything attached talking to nothing.
+Restart=no
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+RuntimeDirectory=ivshmem-server
+RuntimeDirectoryMode=0755
+# instances share the directory, so it must survive any one of them stopping
+RuntimeDirectoryPreserve=yes
+
+# No PrivateTmp= and no PrivateDevices= here on purpose: both give the unit a
+# /dev/shm of its own, and the region would then be visible to nobody else.
+
+[Install]
+WantedBy=multi-user.target

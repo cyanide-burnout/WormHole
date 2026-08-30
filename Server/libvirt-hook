@@ -1,0 +1,71 @@
+#!/bin/bash
+#
+# ivshmem-server hook for libvirt.
+#
+# libvirt does not wait for the socket of a shmem device: QEMU connects to it
+# while the device is realized, and a domain whose server is not up yet fails to
+# start. This runs at prepare/begin -- before QEMU is spawned, with libvirt held
+# waiting for it -- reads the domain XML off stdin and starts the instance every
+# ivshmem-doorbell device of that domain points at.
+#
+# Arguments: $1 domain, $2 operation, $3 sub-operation, $4 extra.
+
+set -u
+
+CONFDIR=/etc/ivshmem-server
+UNIT=ivshmem-server
+
+[ "${2:-}" = prepare ] || exit 0
+
+XML=$(cat)
+
+# every <server path='...'/> that sits inside a <shmem> element, and nothing else
+PATHS=$(printf '%s' "$XML" | awk '
+  /<shmem[ >]/        { inside = 1 }
+  inside && /<server/ {
+    line = $0
+    while (match(line, /path=("[^"]*"|'"'"'[^'"'"']*'"'"')/)) {
+      value = substr(line, RSTART + 5, RLENGTH - 5)
+      print substr(value, 2, length(value) - 2)
+      line = substr(line, RSTART + RLENGTH)
+    }
+  }
+  /<\/shmem>/         { inside = 0 }')
+
+[ -n "$PATHS" ] || exit 0
+
+for path in $PATHS; do
+  instance=
+
+  for file in "$CONFDIR"/*.conf; do
+    [ -e "$file" ] || continue
+    # read out, not sourced: this runs as root out of libvirtd, and a hook is a
+    # poor place to execute a file for the sake of one value in it
+    socket=$(sed -n 's/^[[:space:]]*SOCKET[[:space:]]*=[[:space:]]*//p' "$file" | tail -1)
+    socket=${socket%\'}; socket=${socket#\'}
+    socket=${socket%\"}; socket=${socket#\"}
+    if [ "$socket" = "$path" ]; then
+      instance=$(basename "$file" .conf)
+      break
+    fi
+  done
+
+  if [ -z "$instance" ]; then
+    # somebody else's socket, or one started by hand: leave it be and let QEMU
+    # be the one to complain if it is not there
+    logger -t ivshmem-hook "domain ${1:-?} wants $path, which is no instance of ours"
+    continue
+  fi
+
+  # already up is the common case, and asking systemd for nothing keeps the hook
+  # out of the way of a boot where libvirt-guests is itself still starting
+  systemctl is-active --quiet "$UNIT@$instance" && continue
+
+  if ! systemctl start "$UNIT@$instance"; then
+    logger -t ivshmem-hook "could not start $UNIT@$instance for domain ${1:-?}"
+    echo "ivshmem-server: $UNIT@$instance would not start" >&2
+    exit 1
+  fi
+done
+
+exit 0
