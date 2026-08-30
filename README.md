@@ -7,6 +7,9 @@ Linux inter-VM shared memory client library
   * in host mode using direct connection to *QEMU ivshmem-server*
   * as well as in guest mode using UIO driver
 * Allows to run multiple instances of application in both modes
+* Server side is here as well: *ivshmem-server* is built out of QEMU sources, which
+  compile it and install it nowhere, and put under systemd with an instance per
+  shared region
 * In addition here is integration with io_uring-based main loop (see repository **FastRing**)
 
 ## Driver
@@ -37,6 +40,140 @@ cd Driver
 make
 sudo make install
 ```
+
+## Server
+
+*ivshmem-server* is the other side of host mode: it hands every peer the region
+and the eventfds of all the others. QEMU builds it out of `contrib/` and then
+installs nothing — `install: false` in its `meson.build` is the whole reason no
+distribution carries it, and the disclaimer it prints on startup is the reason
+nobody has asked them to. `Server/` takes it from there: it fetches the sources,
+builds that one binary out of them and puts it under systemd as a template unit
+with an instance per region.
+
+```
+cd Server
+sudo ./install.sh
+```
+
+QEMU is configured with everything but the tools switched off, since the server
+links against `libqemuutil` and wants nothing else, so the build is minutes
+rather than an hour. What comes out is `/usr/local/bin/ivshmem-server`,
+`/usr/local/sbin/ivshmem-server-ctl` and one instance named `default`, running on
+`/run/ivshmem-server/default.sock` with 16M of memory in `/dev/shm/ivshmem-default`.
+`ivshmem-client` is installed along with it, being useful for looking at a region
+without writing anything. `--version`, `--prefix`, `--source`, `--instance` and
+the rest are in `./install.sh --help`, and `make install FLAGS="..."` is the same
+thing said through the Makefile.
+
+The tarball stays in `/var/cache/ivshmem-server` so that a second run has nothing
+to download; the unpacked sources and the build tree are swept once the binary is
+installed, unless `--keep` says otherwise or `--build-only` stopped short of
+installing anything. A tree that is kept is picked up again by the next run, but
+only if it was configured from the same sources for the same prefix — otherwise
+it is thrown away and configured afresh, rather than answering `--version` with
+whatever it was built from the last time. Since all of that is read back, the
+directory has to belong to whoever is building and be closed to everybody else.
+Somewhere world-writable — `/var/tmp`, where a build tree would otherwise
+naturally go — is somewhere a tarball or a `build.ninja` can be left waiting for
+root to find, and this refuses to be that. `--work` moves it under the same rule
+and one more: the directory is marked as ours, and since that mark is what
+`uninstall.sh --purge` takes as leave to `rm -rf` the place, it is only ever put
+on a directory that was made for the build or was empty when it was taken over.
+`--work /etc` would pass every other test there is when root is the one
+building.
+
+### Instances
+
+One unit, one instance per region, one file per instance:
+
+```
+ivshmem-server-ctl add render --size 64M --group kvm
+ivshmem-server-ctl list
+ivshmem-server-ctl remove render --purge
+```
+
+`add` writes `/etc/ivshmem-server/render.conf`, then enables and starts
+`ivshmem-server@render`; over an instance that is already running, `--force`
+restarts it, since a file the running server never read is not a configuration.
+The file is where the socket path, the size, the number of vectors, the name of
+the shared object and the ownership of the socket live; editing it and restarting
+the instance is the whole of reconfiguring one. Two instances are not allowed
+onto one socket or one region.
+
+That file looks like shell and is deliberately not read as shell. Sourcing it
+would run whatever it held before anything could be said about it, and a check
+that comes after the execution is a check of what is left rather than of what was
+done — so it is parsed instead: `KEY=value` of a name the instance knows, quoted
+or not, and a line that is anything else stops the instance where it stands. The
+values are looked at on both sides of the file, going in and coming back out — a
+path is an absolute path, a size is digits and a suffix, a mode is three octal
+digits, the number of vectors is one to sixty-four — so a file edited into
+something strange is refused with a word about which value it was, rather than by
+the server failing oddly later on. The libvirt hook reads the socket path out the
+same way, being root inside libvirtd and no place to execute a file for the sake
+of one line of it.
+
+The socket is bound owned by root and by default reachable by nobody else, so the
+instance is given a group once it is up — `kvm` on Debian, which is what libvirt
+runs QEMU under, and `qemu` where that is the name instead. A host client of your
+own has to be in that group or be root.
+
+A socket left over from a server that was killed rather than stopped is taken
+away at the next start — but only after `ss` has been asked and has answered that
+nothing is serving it. `ss` missing, `ss` failing and `ss` answering nothing at
+all are three ways of not having been told, and none of them is an answer: an
+instance that finds a socket it cannot account for stops and says so instead of
+unlinking one somebody may be serving. That is what `iproute2` is doing among the
+dependencies.
+
+Restarting an instance hands out a *new* region: the server unlinks the shared
+object as it goes down, and neither a guest nor a host client reconnects on its
+own. That is why the unit does not restart itself on failure — coming back up
+quietly would leave everything attached talking to nothing.
+
+### What libvirt will not do for you
+
+It will not wait. A `<shmem>` device turns into a client `-chardev socket`, and
+QEMU connects to it while the device is being realized, blocking there for the
+protocol handshake that carries the file descriptor of the region. There is no
+retry and no timeout to wait out: if the socket is not there, the domain does not
+start, and libvirt reports what QEMU said about the connection.
+
+So the server has to be up first. At boot that is what the ordering in the unit
+is for — instances are `Before=libvirtd.service virtqemud.service
+libvirt-guests.service`, which covers the domains libvirt autostarts. For a
+domain started by hand later, or on a host where the instance is not enabled,
+there is a hook:
+
+```
+sudo ./install.sh --hook
+sudo systemctl restart virtqemud libvirtd
+```
+
+It goes to `/etc/libvirt/hooks/qemu`, runs at `prepare/begin` — before QEMU is
+spawned, with libvirt waiting on it — reads the domain XML, and starts the
+instance every `<shmem>` of that domain points at. A socket that belongs to no
+instance of ours it leaves alone. If one already lives at that path, the hook is
+installed next to it as `qemu.ivshmem` for you to call yourself. libvirt reads
+its hooks when the daemon starts, which is what the restart is for; running
+domains are not disturbed by it.
+
+The domain side is the ordinary thing:
+
+```xml
+<shmem name='ivshmem-default'>
+  <model type='ivshmem-doorbell'/>
+  <size unit='M'>16</size>
+  <server path='/run/ivshmem-server/default.sock'/>
+  <msi vectors='1'/>
+</shmem>
+```
+
+One vector, because that is all the UIO driver can make use of. On a host with
+AppArmor, `/run/...` is outside what the generated profile grants a domain; if
+the domain is denied the socket, either put it where the profile reaches or add
+the path to `/etc/apparmor.d/local/abstractions/libvirt-qemu`.
 
 ## Library
 
@@ -108,27 +245,34 @@ make && ./arena
 `Test/Hole` is the one that wants the real thing. `test.sh 1` runs host clients
 against *ivshmem-server*, `test.sh 2` builds a guest image and boots it with
 *ivshmem-doorbell* so that the guest talks to the host through the driver.
-*ivshmem-server* is not packaged by Debian and has to be built out of the `contrib/`
-directory of QEMU.
+*ivshmem-server* is not packaged by Debian; `Server/` builds it out of the
+`contrib/` directory of QEMU and puts it under systemd.
 
 `Test/Smoke` puts the arena over that same real region. Every peer is given the path
-of the socket or of the UIO device, a name of its own, a number of seconds and the
-least number of distinct senders it has to end up hearing from:
+of the socket or of the UIO device, a name of its own, a number of seconds and how
+many peers take part in the run, itself included:
 
 ```
 cd Test/Smoke
-make && ./smoke /tmp/ivshmem_socket first 30 2
+make && ./smoke /tmp/ivshmem_socket first 30 6
 ```
 
-That last number is what keeps the run honest. A peer left alone takes its own
-messages back out of the queue and would otherwise call that a success; asking for
-two makes it say so only if it has reached somebody else.
-
 Whoever gets there first lays the arena out and the rest attach to it by name. Each
-keeps a lease, pushes a message a second through one lock-free queue, takes a handful
-of whatever has arrived and takes the write lock of a shared region in passing. It
-ends by saying what it sent, what it took, whom it heard from and whether the write
-lock was ever missed.
+keeps a lease, takes the write lock of a shared region once a second, and hears from
+the others two ways at once. It has a queue of its own, named after it, that everybody
+else puts a message into every second; and there is one queue shared by all of them
+that each posts to and takes from as well.
+
+The verdict stands on the first of the two. Nobody competes for an inbox, so hearing
+from every other peer is a matter of the arena working rather than of winning a race,
+and a peer left alone is not mistaken for one that has reached somebody. The shared
+queue is reported and not judged, because competing for one queue is where the
+behaviour worth looking at shows up — and it is not fair. Consumers wake at very
+different speeds: a peer of the host, woken by a write to an eventfd inside its own
+kernel, was measured taking two thirds of everything, while a peer of a guest, which
+waits on a doorbell through a virtual machine exit, took none of it at all. The
+report also counts how often taking failed on a slot a producer had claimed and not
+yet filled in, which is the other way a queue can look empty when it is not.
 
 ### What has been run
 
@@ -150,11 +294,18 @@ On 2026-08-30, Debian 13 and kernel 6.12.107 on both sides of the boundary:
   revision, which had one per hole: the UIO device supports no NOWAIT reads, so an
   asynchronous read of it is served by a kernel worker, whereas watching the source
   and reading it once ready is not.
-* The arena over that region, six peers of `Test/Smoke` at once — two on the host and
-  two in each of the two virtual machines. One laid it out and five attached to it by
-  name, all six held a lease and took the write lock of the region in turn 176 times
-  without missing it once, and put 176 messages through a single lock-free queue of
-  which 176 came back out: none lost, none twice.
+* The arena over that region, peers of `Test/Smoke` on the host and in both virtual
+  machines at once, some of them joining half a minute after the arena had been laid
+  out and had been busy since. One laid it out and the rest attached to it by name,
+  every one of them held a lease and took the write lock of the region without missing
+  it once, and every one of them heard from every other through its own queue. Nothing
+  was ever lost in either direction: 1070 messages sent between the inboxes and 1070
+  taken out of them, 345 posted to the shared queue and 345 taken from it, and both
+  left empty at the end.
+* Taking from a shared queue is not fair, and it was never once held up by a slot
+  a producer had claimed and not filled in. Of the 345 messages a peer of the host
+  took 220 and a peer of a guest took none, which is the difference between waking
+  inside a kernel and waking through a virtual machine exit.
 
 What has not been run: the ways a peer can die in the middle of something — the
 sweeps that give back its blocks, its locks and the queue slots it took and never

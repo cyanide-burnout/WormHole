@@ -14,21 +14,36 @@
 #include "WormArena.h"
 
 // Everything below runs over a real shared region of ivshmem, host mode and guest
-// mode alike, and every peer is both a producer and a consumer of the same queue
+// mode alike. Every peer has two ways of hearing from the others: a queue of its own
+// that the rest put messages into by name, and one queue shared by everybody. The
+// verdict stands on the first, because nobody competes for it; the second is there
+// to be reported, because competing for one queue is where the interesting behaviour
+// of an arena shows up
 
 #define ARENA_NAME      "smoke"
 #define ARENA_TIMEOUT    1000
 #define ARENA_LEASE     10000
 
-#define POOL_BLOCKS        64
+#define POOL_BLOCKS       128
 #define POOL_LENGTH       256
 #define QUEUE_SLOTS        64
+#define INBOX_SLOTS        32
 #define REGION_LENGTH    4096
 
 #define TICK             1000
 #define SENDERS            16
-#define PORTION             8
+#define PORTION             1
+#define SETTLE              8
 #define STATE_RUNNING      -1
+
+// An inbox is named after the slot of its owner and not after its name. A collection
+// cannot be deleted once it is laid out, so a name of a peer would burn a slot of the
+// table for good and a run of enough peers would exhaust it; there are only ever as
+// many slots for entities as there are, and an inbox is reused along with one. It
+// also keeps the name short: what a collection carries is 64 bytes and no more, and
+// a peer with a long name would have laid out an inbox nobody could find by name
+
+#define INBOX_NAME(buffer, number)  snprintf(buffer, sizeof(buffer), "inbox-%u", (unsigned)(number))
 
 struct State
 {
@@ -41,11 +56,15 @@ struct Context
   struct WormArena* arena;
   struct WormArenaCollection* pool;
   struct WormArenaCollection* queue;
+  struct WormArenaCollection* inbox;
   struct WormArenaCollection* region;
   const char* name;
   uint32_t sent;
-  uint32_t taken;
+  uint32_t posted;
   uint32_t refused;
+  uint32_t taken;
+  uint32_t shared;
+  uint32_t stalled;
   uint32_t bells;
   uint32_t turns;
   uint32_t missed;
@@ -77,6 +96,15 @@ static void HandleSignal(int signal)
   atomic_store_explicit(&running, EXIT_SUCCESS, memory_order_relaxed);
 }
 
+static uint64_t GetTime()
+{
+  struct timespec value;
+
+  clock_gettime(CLOCK_REALTIME, &value);
+
+  return (uint64_t)value.tv_sec * 1000000000ULL + (uint64_t)value.tv_nsec;
+}
+
 static void NoteSender(struct Context* context, const char* message)
 {
   uint32_t index;
@@ -104,24 +132,64 @@ static void NoteSender(struct Context* context, const char* message)
   }
 }
 
-static void Drain(struct Context* context)
+static void Discard(struct WormArena* arena, struct WormArenaCollection* queue)
 {
   struct WormArenaDescriptor* descriptor;
-  uint32_t portion;
 
-  // One doorbell wakes every process of a machine at once, so a consumer that emptied
-  // the queue on every wakeup would leave its neighbours nothing and hold up the loop
-  // besides. What is left over comes with the next bell
+  // A slot of an entity comes back around, and so does the inbox named after it, so
+  // whatever the peer before us never took is given back to the pool here
 
-  portion = PORTION;
+  while (descriptor = PopWormArenaQueue(arena, queue))
+  {
+    //
+    ReleaseWormArenaDescriptor(descriptor);
+  }
+}
 
-  while ((portion != 0) &&
-         (descriptor = PopWormArenaQueue(context->arena, context->queue)))
+static void TakeInbox(struct Context* context)
+{
+  struct WormArenaDescriptor* descriptor;
+
+  // Nobody else takes from here, so it is emptied without a second thought
+
+  while (descriptor = PopWormArenaQueue(context->arena, context->inbox))
   {
     NoteSender(context, (const char*)descriptor->data);
     ReleaseWormArenaDescriptor(descriptor);
     context->taken ++;
-    portion --;
+  }
+}
+
+static void TakeQueue(struct Context* context, uint32_t portion)
+{
+  struct WormArenaDescriptor* descriptor;
+  ATOMIC(uint64_t)* slots;
+  uint64_t value;
+
+  // One message per wakeup and no more. A bell only says that something may have
+  // arrived, and whoever grabs a batch on every bell starves the slower participants:
+  // a peer of the host, which wakes without leaving its machine, was measured taking
+  // two thirds of everything while a peer of a guest took none
+
+  while (portion != 0)
+  {
+    if (descriptor = PopWormArenaQueue(context->arena, context->queue))
+    {
+      ReleaseWormArenaDescriptor(descriptor);
+      context->shared ++;
+      portion --;
+      continue;
+    }
+
+    // Taking has failed, and an empty queue is only one of the two reasons for it: a
+    // slot that a producer has claimed and not filled in yet holds the whole queue up
+    // until it does, and the two are worth telling apart
+
+    slots = (ATOMIC(uint64_t)*)(context->arena->hole->memory + context->queue->offset);
+    value = atomic_load_explicit(slots + (context->queue->head & (context->queue->count - 1)), memory_order_acquire);
+
+    context->stalled += (WORM_SLOT_RESERVED(value) != 0);
+    return;
   }
 }
 
@@ -129,27 +197,51 @@ static void HandleBell(struct WormHole* hole)
 {
   struct Context* context;
 
-  if (context = (struct Context*)hole->closure)
+  if ((context = (struct Context*)hole->closure) &&
+      (context->arena != NULL))
   {
     context->bells ++;
 
-    if (context->arena != NULL)
-    {
-      // Taking from a queue waits for nothing, so a bell is a fair place for it
-      Drain(context);
-    }
+    // Taking from a queue waits for nothing, so a bell is a fair place for it
+    TakeInbox(context);
+    TakeQueue(context, PORTION);
   }
+}
+
+static int Post(struct Context* context, struct WormArenaCollection* queue, const char* text)
+{
+  struct WormArenaDescriptor* message;
+  int result;
+
+  result = -1;
+
+  if (message = CreateWormArenaDescriptor(context->arena, context->pool, NULL, POOL_LENGTH, ARENA_TIMEOUT))
+  {
+    snprintf((char*)message->data, POOL_LENGTH, "%s", text);
+    result = PushWormArenaQueue(context->arena, queue, message);
+    ReleaseWormArenaDescriptor(message);
+  }
+
+  context->refused += (result != 0);
+
+  return result;
 }
 
 static void HandleTimeout(struct FastRingDescriptor* descriptor)
 {
   struct Context* context;
-  struct WormArenaDescriptor* message;
+  struct WormArenaMagic* magic;
+  struct WormArenaEntity* entity;
+  struct WormArenaCollection* inbox;
   struct State* state;
   uint32_t generation;
+  uint32_t index;
+  uint64_t time;
   char text[POOL_LENGTH];
+  char name[32];
 
   context = (struct Context*)descriptor->closure;
+  magic   = (struct WormArenaMagic*)context->arena->hole->memory;
 
   if (TouchWormArena(context->arena, ARENA_LEASE, ARENA_TIMEOUT) != 0)
   {
@@ -158,18 +250,42 @@ static void HandleTimeout(struct FastRingDescriptor* descriptor)
     context->lapsed ++;
   }
 
-  snprintf(text, sizeof(text), "%s %u", context->name, context->sent);
+  // Taking comes before putting on purpose: a peer that drained right after its own
+  // push would find the shared queue holding nothing but the message it had just
+  // made, and would go on eating its own tail while never hearing anybody
 
-  if (message = CreateWormArenaDescriptor(context->arena, context->pool, NULL, sizeof(text), ARENA_TIMEOUT))
+  TakeInbox(context);
+  TakeQueue(context, PORTION);
+
+  snprintf(text, sizeof(text), "%s %u", context->name, context->posted);
+  time = GetTime();
+
+  for (index = 0; index < WORM_ARENA_ENTITIES; index ++)
   {
-    strcpy((char*)message->data, text);
+    entity = magic->entities + index;
 
-    if (PushWormArenaQueue(context->arena, context->queue, message) == 0)
-      context->sent ++;
-    else
-      context->refused ++;
+    if ((atomic_load_explicit(&entity->time, memory_order_acquire) >= time) &&
+        (entity->name[0] != '\0') &&
+        (strcmp(entity->name, context->name) != 0))
+    {
+      // A peer that is there but whose inbox is not laid out yet is simply skipped,
+      // it will be there by the next turn
 
-    ReleaseWormArenaDescriptor(message);
+      INBOX_NAME(name, index);
+
+      if ((inbox = FindWormArenaCollection(context->arena, name, WORM_COLLECTION_QUEUE)) &&
+          (Post(context, inbox, text) == 0))
+      {
+        //
+        context->sent ++;
+      }
+    }
+  }
+
+  if (Post(context, context->queue, text) == 0)
+  {
+    //
+    context->posted ++;
   }
 
   if (LockWormArenaRegion(context->arena, context->region, WORM_LOCK_WRITE, ARENA_TIMEOUT, &generation) == 0)
@@ -189,7 +305,6 @@ static void HandleTimeout(struct FastRingDescriptor* descriptor)
   }
 
   KickAllWormArenaEntities(context->arena);
-  Drain(context);
 }
 
 int main(int count, const char** arguments)
@@ -204,6 +319,8 @@ int main(int count, const char** arguments)
   uint32_t generation;
   uint32_t index;
   char name[64];
+  char title[32];
+  struct timespec pause;
   time_t moment;
   int seconds;
   int peers;
@@ -214,9 +331,8 @@ int main(int count, const char** arguments)
   if (count < 2)
   {
     printf("%s <path to ivshmem socket or UIO device> [name] [seconds] [peers]\n", arguments[0]);
-    printf("  peers is the least number of distinct senders this run has to hear from,\n");
-    printf("  itself included, so a lonely peer taking its own messages back is not\n");
-    printf("  mistaken for a peer that has actually reached somebody\n");
+    printf("  peers is how many take part in the run, this one included, and the run\n");
+    printf("  says nothing good unless it has heard from every one of the others\n");
     return EXIT_FAILURE;
   }
 
@@ -236,6 +352,15 @@ int main(int count, const char** arguments)
   context.name = name;
   seconds      = (count > 3) ? atoi(arguments[3]) : 20;
   peers        = (count > 4) ? atoi(arguments[4]) : 1;
+
+  if ((peers < 1) ||
+      (peers > SENDERS + 1))
+  {
+    // Fewer than one is not a run at all, and more than the table of senders can hold
+    // could never be satisfied however well everything worked
+    printf("The number of peers has to be between 1 and %d\n", SENDERS + 1);
+    return EXIT_FAILURE;
+  }
 
   if ((hole = CreateWormHole(arguments[1], HandleBell, &context)) == NULL)
   {
@@ -260,14 +385,19 @@ int main(int count, const char** arguments)
     return EXIT_FAILURE;
   }
 
-  // Whoever gets there first lays these out and the rest attach to them by name
+  // Whoever gets there first lays the shared ones out and the rest attach to them by
+  // name. The inbox belongs to this peer alone and is named after it
+
+  INBOX_NAME(title, context.arena->entity->number);
 
   context.pool   = CreateWormArenaPool(context.arena, "messages", POOL_BLOCKS, POOL_LENGTH, ARENA_TIMEOUT);
   context.queue  = CreateWormArenaQueue(context.arena, "events", QUEUE_SLOTS, ARENA_TIMEOUT);
+  context.inbox  = CreateWormArenaQueue(context.arena, title, INBOX_SLOTS, ARENA_TIMEOUT);
   context.region = CreateWormArenaRegion(context.arena, "state", REGION_LENGTH, ARENA_TIMEOUT);
 
   if ((context.pool   == NULL) ||
       (context.queue  == NULL) ||
+      (context.inbox  == NULL) ||
       (context.region == NULL))
   {
     printf("Error creating the collections\n");
@@ -275,6 +405,8 @@ int main(int count, const char** arguments)
     ReleaseWormHole(hole);
     return EXIT_FAILURE;
   }
+
+  Discard(context.arena, context.inbox);
 
   ring       = CreateFastRing(0);
   loop       = CreateWormLoop(ring, hole);
@@ -314,14 +446,41 @@ int main(int count, const char** arguments)
   ReleaseWormLoop(loop);
   ReleaseFastRing(ring);
 
+  // Emptying comes first and the lease is kept alive through all of it. Taking from a
+  // queue puts a hold on the block behind the message, and the hold is put on in the
+  // name of this entity: doing that once the lease has been let go of would leave the
+  // holds of a peer everybody else already counts as dead, for the next sweep to take
+  // back under a descriptor still in hand. The entity dies at ReleaseWormArena and
+  // not a moment sooner
+  //
+  // What arrives between the last take and that moment is not raced for, it is left
+  // where it is, and it holds a block of the pool for as long as it lies there. An
+  // inbox is named after the slot of its owner, and whoever takes the slot next
+  // empties it before doing anything else, so the block is out on loan for a turn of
+  // the wheel rather than gone
+
+  pause.tv_sec  = 0;
+  pause.tv_nsec = TICK * 1000000L / 4;
+
+  for (index = 0; index < SETTLE; index ++)
+  {
+    if (TouchWormArena(context.arena, ARENA_LEASE, ARENA_TIMEOUT) != 0)
+    {
+      // The lease is gone and so, to everybody else, is this peer. Taking from a queue
+      // now would put the hold of a dead entity on a block, for the next sweep to take
+      // back from under a descriptor still in hand
+
+      context.lapsed ++;
+      break;
+    }
+
+    TakeInbox(&context);
+    TakeQueue(&context, QUEUE_SLOTS);
+    nanosleep(&pause, NULL);
+  }
+
   printf("\n");
-  printf("  sent     %u\n", context.sent);
-  printf("  taken    %u\n", context.taken);
-  printf("  refused  %u\n", context.refused);
-  printf("  bells    %u\n", context.bells);
-  printf("  turns    %u taken, %u missed\n", context.turns, context.missed);
-  printf("  lease    %u extensions refused\n", context.lapsed);
-  printf("  senders  %u:", context.count);
+  printf("  inbox    %u sent, %u taken from %u senders:", context.sent, context.taken, context.count);
 
   for (index = 0; index < context.count; index ++)
   {
@@ -329,18 +488,21 @@ int main(int count, const char** arguments)
     printf(" %s", context.sender[index]);
   }
 
-  printf("\n\n");
+  printf("\n");
+  printf("  queue    %u posted, %u taken, %u refused, %u stalled on a claimed slot\n", context.posted, context.shared, context.refused, context.stalled);
+  printf("  region   %u turns, %u missed\n", context.turns, context.missed);
+  printf("  lease    %u extensions refused\n", context.lapsed);
+  printf("  bells    %u\n\n", context.bells);
 
-  Check(context.sent  != 0, "blocks are taken out of the pool and pushed, %u of them", context.sent);
-  Check(context.taken != 0, "messages come back out of the queue, %u of them", context.taken);
-  Check(context.turns != 0, "the write lock of the region is taken, %u times", context.turns);
+  Check(context.posted != 0, "blocks are taken out of the pool and pushed, %u of them", context.posted);
+  Check(context.turns  != 0, "the write lock of the region is taken, %u times", context.turns);
   Check(context.missed == 0, "and never missed, %u missed", context.missed);
   Check(context.lapsed == 0, "the lease is held for the whole run, %u extensions refused", context.lapsed);
 
-  // A lonely peer takes its own messages back and would call that a success, so the
-  // run has to be told how many distinct senders it is supposed to end up hearing
+  // Nobody competes for an inbox, so hearing from every other peer is a matter of the
+  // arena working and not of winning a race for the head of a queue somebody shares
 
-  Check(context.count >= (uint32_t)peers, "at least %d distinct senders are heard, heard %u", peers, context.count);
+  Check(context.count >= (uint32_t)(peers - 1), "every one of the %d other peers is heard in the inbox, heard %u", peers - 1, context.count);
 
   if (LockWormArenaRegion(context.arena, context.region, WORM_LOCK_READ, ARENA_TIMEOUT, &generation) == 0)
   {
