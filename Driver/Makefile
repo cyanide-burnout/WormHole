@@ -1,8 +1,11 @@
 CONFIG_MODULE_SIG := n
 obj-m             := uio_ivshmem.o
 
-NAME    := uio-ivshmem
-VERSION := $(shell sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' dkms.conf)
+# kbuild runs this Makefile from the kernel tree, so dkms.conf has to be
+# addressed through the directory this very Makefile was read from
+HERE    := $(patsubst %/,%,$(dir $(lastword $(MAKEFILE_LIST))))
+NAME    := $(shell sed -n 's/^PACKAGE_NAME="\(.*\)"/\1/p' $(HERE)/dkms.conf)
+VERSION := $(shell sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' $(HERE)/dkms.conf)
 SRCDIR  := /usr/src/$(NAME)-$(VERSION)
 
 # DKMS sets KERNELRELEASE when it rebuilds for a kernel other than the running

@@ -323,3 +323,12 @@ void HandleWormHoleInterruptEvent(struct WormHole* hole, int64_t value)
     hole->bell(hole);
   }
 }
+
+void HandleWormHoleLossEvent(struct WormHole* hole)
+{
+  if (hole->loss != NULL)
+  {
+    // Loss could be unused
+    hole->loss(hole);
+  }
+}

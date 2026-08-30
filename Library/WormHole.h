@@ -18,6 +18,7 @@ extern "C"
 struct WormHole;
 
 typedef void (*HandleWormHoleBellFunction)(struct WormHole* hole);
+typedef void (*HandleWormHoleLossFunction)(struct WormHole* hole);
 typedef void (*ReleaseWormHoleFunction)(struct WormHole* hole);
 typedef int (*KickWormHoleFunction)(struct WormHole* hole, uint32_t identifier);
 
@@ -41,6 +42,7 @@ struct WormHole
   KickWormHoleFunction kick;
   ReleaseWormHoleFunction release;
   HandleWormHoleBellFunction bell;
+  HandleWormHoleLossFunction loss;
 
   uint64_t identifier;  // Local peer ID
   uint8_t* memory;      // Pointer to shared memory
@@ -59,6 +61,7 @@ struct WormHole* CreateWormHole(const char* path, HandleWormHoleBellFunction fun
 
 int HandleWormHoleHostServerEvent(struct WormHole* hole);
 void HandleWormHoleInterruptEvent(struct WormHole* hole, int64_t value);
+void HandleWormHoleLossEvent(struct WormHole* hole);
 
 static inline __attribute__((always_inline)) int KickWormHole(struct WormHole* hole, uint32_t identifier)
 {

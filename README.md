@@ -93,6 +93,49 @@ On top of the library there is **WormArena** — a store of named objects, pools
 blocks and lock-free queues laid out inside the shared memory, meant to be used by
 several processes on several machines at once. See [Arena.md](Arena.md).
 
+## Testing
+
+`Test/Arena` needs neither the driver nor a server: an anonymous shared mapping
+stands in for ivshmem and `fork` for the peers. It covers the layout and the leases,
+the pools, the queues and the descriptors, and four ways of a peer dying in the
+middle of something — 72 checks in all.
+
+```
+cd Test/Arena
+make && ./arena
+```
+
+`Test/Hole` is the one that wants the real thing. `test.sh 1` runs host clients
+against *ivshmem-server*, `test.sh 2` builds a guest image and boots it with
+*ivshmem-doorbell* so that the guest talks to the host through the driver.
+*ivshmem-server* is not packaged by Debian and has to be built out of the `contrib/`
+directory of QEMU.
+
+### What has been run
+
+On 2026-08-30, Debian 13 and kernel 6.12.107 on both sides of the boundary:
+
+* Host mode, several clients on one *ivshmem-server*: doorbells travel both ways,
+  and when the server is killed the loss is reported once and the client falls
+  silent instead of spinning.
+* Guest mode through the driver: the module loads, `/dev/uio0` appears with a
+  region of the expected size, and the bells cross the boundary of the virtual
+  machine in both directions.
+* Twelve clients at once — four on the host and four in each of two virtual
+  machines — and every one of them sees all twelve sources. A machine is a single
+  peer however many processes it runs: the four in a guest share one ID, while the
+  four on the host have one each.
+* All four processes holding one `/dev/uio0` are woken by an interrupt, not merely
+  the first of them.
+* No io-wq worker is left parked in a blocking read. Measured against the previous
+  revision, which had one per hole: the UIO device supports no NOWAIT reads, so an
+  asynchronous read of it is served by a kernel worker, whereas watching the source
+  and reading it once ready is not.
+
+What has not been run: **WormArena** has never seen a real shared region. It is
+covered only by `Test/Arena`, where the memory is ordinary and cacheable and every
+peer is on one machine.
+
 ## Limits
 
 * Only one IRQ vector is supported because of UIO limits

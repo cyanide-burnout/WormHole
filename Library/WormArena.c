@@ -452,8 +452,8 @@ int KickAllWormArenaEntities(struct WormArena* arena)
 
     for (index = 1; index < number; index ++)
     {
-      if ((magic->entities + index != arena->entity)                                            &&
-          (atomic_load_explicit(&magic->entities[index].time, memory_order_acquire) >= time)     &&
+      if (((magic->entities + index) != arena->entity)                                          &&
+          (atomic_load_explicit(&magic->entities[index].time, memory_order_acquire)    >= time) &&
           (atomic_load_explicit(&magic->entities[index].address, memory_order_relaxed) == address))
       {
         //
@@ -486,8 +486,8 @@ static struct WormArenaCollection* GetBlockPool(struct WormArena* arena, struct 
     collection = magic->collections + number;
 
     if ((atomic_load_explicit(&collection->type, memory_order_acquire) == WORM_COLLECTION_POOL) &&
-        (offset >= collection->offset)                                                          &&
-        (offset <  collection->offset + collection->size))
+        (offset >=  collection->offset)                                                         &&
+        (offset <  (collection->offset + collection->size)))
     {
       //
       return collection;
@@ -646,8 +646,8 @@ struct WormArenaCollection* CreateWormArenaRegion(struct WormArena* arena, const
       offset = GetFreeOffset(magic);
       size   = ALIGN_OFFSET(size);
 
-      if ((offset <= hole->length)          &&
-          (size   <= hole->length - offset) &&
+      if ((offset <=  hole->length)           &&
+          (size   <= (hole->length - offset)) &&
           (collection = AddArenaCollection(magic, name, offset, size)))
       {
         // Whatever the region is going to keep is none of the business of the arena
@@ -697,8 +697,8 @@ struct WormArenaCollection* CreateWormArenaQueue(struct WormArena* arena, const 
       offset = GetFreeOffset(magic);
       length = ALIGN_OFFSET((uint64_t)slots * sizeof(uint64_t));
 
-      if ((offset <= hole->length)            &&
-          (length <= hole->length - offset)   &&
+      if ((offset <=  hole->length)           &&
+          (length <= (hole->length - offset)) &&
           (collection = AddArenaCollection(magic, name, offset, length)))
       {
         // A zeroed table is a table of empty slots, nothing else has to be laid out
@@ -761,10 +761,10 @@ struct WormArenaCollection* CreateWormArenaPool(struct WormArena* arena, const c
       offset = GetFreeOffset(magic);
       length = ALIGN_OFFSET(size);
       data   = ALIGN_OFFSET(offset + (uint64_t)blocks * sizeof(struct WormArenaBlock));
-      if ((blocks < WORM_BLOCK_NONE)  &&
-          (data   <= hole->length)    &&
-          (length != 0)               &&
-          (blocks <= (hole->length - data) / length))
+      if ((blocks <   WORM_BLOCK_NONE) &&
+          (data   <=  hole->length)    &&
+          (length !=  0)               &&
+          (blocks <= ((hole->length - data) / length)))
       {
         table = (struct WormArenaBlock*)(hole->memory + offset);
 
@@ -1841,10 +1841,10 @@ static int CheckArena(struct WormHole* hole, const char* name)
     length = (type == WORM_COLLECTION_POOL)  * sizeof(struct WormArenaBlock) +
              (type == WORM_COLLECTION_QUEUE) * sizeof(uint64_t);
 
-    if ((collection->offset < sizeof(struct WormArenaMagic))          ||
-        (collection->offset > hole->length)                           ||
-        (collection->size   > hole->length - collection->offset)      ||
-        ((length != 0) && (collection->count > collection->size / length)))
+    if ((collection->offset <  sizeof(struct WormArenaMagic))      ||
+        (collection->offset >  hole->length)                       ||
+        (collection->size   > (hole->length - collection->offset)) ||
+        ((length != 0) && (collection->count > (collection->size / length))))
     {
       //
       return -EPROTO;

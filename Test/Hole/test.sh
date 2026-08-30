@@ -32,13 +32,15 @@ then
   ./test /tmp/ivshmem_socket &
   PROCESS2=$$
 
-  virt-builder debian-12 \
+  virt-builder debian-13 \
     --arch x86_64 \
     --output /tmp/test.img \
     --root-password password:test \
+    --install linux-image-amd64 \
     --mkdir /opt/WormHole \
     --copy-in ../../:/opt/WormHole/ \
     --copy-in ../../../FastRing/Ring:/opt/WormHole/ \
+    --copy-in ../../../TetraPack/Product/Toolkit:/opt/WormHole/ \
     --firstboot-command '/opt/WormHole/guest.sh' \
   && \
   sudo qemu-system-x86_64 \

@@ -13,7 +13,8 @@ struct WormLoop
 {
   struct WormHole* hole;
   struct FastRing* ring;
-  struct FastRingDescriptor* descriptor;
+  struct FastRingDescriptor* source;  // Watch of event source delivering the bell
+  struct FastRingDescriptor* server;  // Watch of connection to ivshmem-server (host mode only)
 };
 
 struct WormLoop* CreateWormLoop(struct FastRing* ring, struct WormHole* hole);

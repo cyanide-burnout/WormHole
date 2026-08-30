@@ -8,7 +8,7 @@ ip route add default via 192.168.100.1 dev $INTERFACE
 echo nameserver 8.8.8.8 > /etc/resolv.conf
 
 apt-get update
-apt-get install -y build-essential pkg-config liburing-dev linux-headers-$(uname -r)
+apt-get install -y build-essential pkg-config liburing-dev linux-headers-$(dpkg --print-architecture)
 
 cd /opt/WormHole/Driver
 
@@ -16,10 +16,10 @@ make clean
 make
 make install
 
-cd /opt/WormHole/Test
+cd /opt/WormHole/Test/Hole
 
-make FASTRING=../Ring WORMHOLE=../Library clean
-make FASTRING=../Ring WORMHOLE=../Library
+make FASTRING=../../Ring WORMHOLE=../../Library TOOLKIT=../../Toolkit clean
+make FASTRING=../../Ring WORMHOLE=../../Library TOOLKIT=../../Toolkit
 
 ./test /dev/uio0
 

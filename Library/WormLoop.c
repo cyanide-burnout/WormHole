@@ -2,39 +2,61 @@
 
 #include <malloc.h>
 
-static int HandleInterruptEvent(struct FastRingDescriptor* descriptor, struct io_uring_cqe* completion, int reason)
+#define POLL_EVENT_LOST  (POLLERR | POLLHUP | POLLNVAL)
+
+static void HandleInterruptEvent(struct FastRingDescriptor* descriptor, int result)
 {
   struct WormLoop* loop;
 
-  if (( completion != NULL) &&
-      (~completion->user_data & RING_DESC_OPTION_IGNORE))
+  loop = (struct WormLoop*)descriptor->closure;
+
+  if ((result > 0) &&
+      (result & POLLIN))
   {
-    loop = (struct WormLoop*)descriptor->closure;
-    HandleWormHoleInterruptEvent(loop->hole, (int64_t)descriptor->data.number);
-    SubmitFastRingDescriptor(descriptor, 0);
-    return 1;
+    // Value is read by the handler itself, watch reports readiness only
+    HandleWormHoleInterruptEvent(loop->hole, HOLE_CLIENT_VALUE_READ);
   }
 
-  return 0;
+  if ((result < 0) ||
+      (result & POLL_EVENT_LOST))
+  {
+    // Event source is gone, there is nothing to wait for anymore
+    loop->source = NULL;
+    RemoveFastRingWatch(descriptor);
+    HandleWormHoleLossEvent(loop->hole);
+  }
 }
 
-static void HandleHostServerEvent(int handle, uint32_t flags, void* closure, uint64_t options)
+static void HandleHostServerEvent(struct FastRingDescriptor* descriptor, int result)
 {
   struct WormLoop* loop;
   struct WormHole* hole;
-  struct FastRingDescriptor* descriptor;
+  int status;
 
-  loop = (struct WormLoop*)closure;
-  hole = loop->hole;
+  loop   = (struct WormLoop*)descriptor->closure;
+  hole   = loop->hole;
+  status = (result < 0) || (result & POLL_EVENT_LOST);
 
-  HandleWormHoleHostServerEvent(loop->hole);
-
-  if ((loop->descriptor == NULL) &&
-      (hole->handle     >= 0))
+  if ((result > 0) &&
+      (result & POLLIN))
   {
-    descriptor = loop->descriptor = AllocateFastRingDescriptor(loop->ring, HandleInterruptEvent, loop);
-    io_uring_prep_read(&descriptor->submission, hole->handle, &descriptor->data.number, hole->size, 0);
-    SubmitFastRingDescriptor(descriptor, 0);
+    // Messages are drained until the socket buffer gets empty
+    status |= (HandleWormHoleHostServerEvent(hole) <= 0);
+
+    if ((loop->source == NULL) &&
+        (hole->handle >= 0))
+    {
+      // Server has just granted an eventfd of the peer itself
+      loop->source = AddFastRingWatch(loop->ring, hole->handle, POLLIN, 0, HandleInterruptEvent, loop);
+    }
+  }
+
+  if (status)
+  {
+    // Connection to ivshmem-server is gone, there is nothing to expect anymore
+    loop->server = NULL;
+    RemoveFastRingWatch(descriptor);
+    HandleWormHoleLossEvent(hole);
   }
 }
 
@@ -43,7 +65,8 @@ static int KickHostWormHole(struct WormHole* hole, uint32_t identifier)
   struct WormLoop* loop;
   struct FastRingDescriptor* descriptor;
 
-  if ((hole->host.handles[identifier] >= 0) &&
+  if ((identifier <= UINT16_MAX) &&
+      (hole->host.handles[identifier] >= 0) &&
       (loop       = (struct WormLoop*)hole->extension) &&
       (descriptor = AllocateFastRingDescriptor(loop->ring, NULL, NULL)))
   {
@@ -59,32 +82,41 @@ static int KickHostWormHole(struct WormHole* hole, uint32_t identifier)
 struct WormLoop* CreateWormLoop(struct FastRing* ring, struct WormHole* hole)
 {
   struct WormLoop* loop;
-  struct FastRingDescriptor* descriptor;
 
-  if ((ring == NULL) ||
-      (hole == NULL))
+  loop = NULL;
+
+  if ((ring != NULL) &&
+      (hole != NULL) &&
+      (loop  = (struct WormLoop*)calloc(1, sizeof(struct WormLoop))))
   {
-    //
-    return NULL;
-  }
+    loop->ring = ring;
+    loop->hole = hole;
 
-  loop       = (struct WormLoop*)calloc(1, sizeof(struct WormLoop));
-  loop->ring = ring;
-  loop->hole = hole;
+    switch (hole->type)
+    {
+      case HOLE_CLIENT_TYPE_HOST:
+        // Own eventfd is not granted yet, event source is watched later
+        if (loop->server = AddFastRingWatch(ring, hole->host.socket, POLLIN, 0, HandleHostServerEvent, loop))
+        {
+          hole->extension = loop;
+          hole->kick      = KickHostWormHole;
+        }
+        break;
 
-  switch (hole->type)
-  {
-    case HOLE_CLIENT_TYPE_HOST:
-      hole->extension = loop;
-      hole->kick      = KickHostWormHole;
-      AddFastRingPoll(ring, hole->host.socket, RING_POLL_READ | RING_POLL_ERROR | RING_POLL_HANGUP | RING_POLL_SHOT | RING_POLL_REPEAT, HandleHostServerEvent, loop);
-      break;
+      case HOLE_CLIENT_TYPE_GUEST:
+        // UIO device has no support of NOWAIT reads, watch keeps io-wq out of the way
+        loop->source = AddFastRingWatch(ring, hole->handle, POLLIN, 0, HandleInterruptEvent, loop);
+        break;
+    }
 
-    case HOLE_CLIENT_TYPE_GUEST:
-      descriptor = loop->descriptor = AllocateFastRingDescriptor(loop->ring, HandleInterruptEvent, loop);
-      io_uring_prep_read(&descriptor->submission, hole->handle, &descriptor->data.number, hole->size, 0);
-      SubmitFastRingDescriptor(descriptor, 0);
-      break;
+    if ((loop->server == NULL) &&
+        (loop->source == NULL))
+    {
+      // Exactly one of the two is expected by now, and a loop that watches nothing
+      // would keep silent instead of failing, which is worse than not being created
+      free(loop);
+      loop = NULL;
+    }
   }
 
   return loop;
@@ -93,31 +125,19 @@ struct WormLoop* CreateWormLoop(struct FastRing* ring, struct WormHole* hole)
 void ReleaseWormLoop(struct WormLoop* loop)
 {
   struct WormHole* hole;
-  struct FastRingDescriptor* descriptor;
 
   if (loop != NULL)
   {
     if ((hole = loop->hole) &&
-        (hole->type == HOLE_CLIENT_TYPE_HOST))
+        (hole->extension == loop))
     {
-      // There are no frequent events, poll interface is enough
-      RemoveFastRingPoll(loop->ring, hole->host.socket);
+      // Kick has to fail rather than to reach the released loop
+      hole->extension = NULL;
+      hole->kick      = NULL;
     }
 
-    if ((descriptor = loop->descriptor) &&
-        (descriptor->state == RING_DESC_STATE_PENDING))
-    {
-      descriptor->submission.opcode     = IORING_OP_NOP;
-      descriptor->submission.user_data |= RING_DESC_OPTION_IGNORE;
-      loop->descriptor                  = NULL;
-    }
-
-    if (descriptor = loop->descriptor)
-    {
-      atomic_fetch_add_explicit(&descriptor->references, 1, memory_order_relaxed);
-      io_uring_prep_cancel(&descriptor->submission, descriptor, 0);
-      SubmitFastRingDescriptor(descriptor, RING_DESC_OPTION_IGNORE);
-    }
+    RemoveFastRingWatch(loop->server);
+    RemoveFastRingWatch(loop->source);
 
     free(loop);
   }
