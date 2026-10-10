@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/sysmacros.h>
 
 #include <stdio.h>
 
@@ -119,7 +120,7 @@ static struct WormHole* CreateHostWormHole(const char* path, struct stat* status
     if ((hole->host.socket < 0) ||
         (connect(hole->host.socket, (struct sockaddr*)&address, sizeof(struct sockaddr_un)) < 0)                 ||
         (ReadHostServerMessage(hole, &value, NULL, 0) < 0)               || (value  != IVSHMEM_PROTOCOL_VERSION) ||
-        (ReadHostServerMessage(hole, &hole->identifier, &handle, 0) < 0) || (handle != -1)                       ||
+        (ReadHostServerMessage(hole, (int64_t*)&hole->identifier, &handle, 0) < 0) || (handle != -1)             ||
         (ReadHostServerMessage(hole, &value, &hole->host.memory, 0) < 0) || (value  != -1)                       ||
         (fstat(hole->host.memory, status) < 0)                                                                   ||
         ((hole->memory = (uint8_t*)mmap(NULL, status->st_size, PROT_READ | PROT_WRITE, MAP_SHARED, hole->host.memory, 0)) == MAP_FAILED))
@@ -220,7 +221,7 @@ static int ReadSystemValue(struct stat* status, const char* parameter, char* buf
   int handle;
   int result;
 
-  snprintf(path, PATH_MAX, "/sys/dev/char/%d:%d/%s", status->st_rdev >> 8, status->st_rdev & 0xff, parameter);
+  snprintf(path, PATH_MAX, "/sys/dev/char/%u:%u/%s", major(status->st_rdev), minor(status->st_rdev), parameter);
   memset(buffer, 0, size);
 
   result = -1;
