@@ -80,7 +80,7 @@ read from the `IVPosition` register. A socket is taken for *ivshmem-server* and 
 host hole: the client connects, expects protocol version `0`, receives its ID and the
 descriptor of the shared object, and maps the whole object. `function` is the bell and
 `closure` is stored in the hole. Returns `NULL` when `path` does not exist or is neither,
-or when any step fails.
+when the path of a socket does not fit into a socket address, or when any step fails.
 
 **`ReleaseWormHole`** unmaps the region, closes every descriptor the hole holds and
 frees it. Accepts `NULL`.
@@ -90,12 +90,9 @@ frees it. Accepts `NULL`.
 | Mode | `0` | `-EBADF` |
 |------|-----|----------|
 | Guest | Always: the ID is written to the doorbell register | — |
-| Host | The value `1` has been written to the eventfd of the peer | No eventfd for that ID, or the write failed |
+| Host | The value `1` has been written to the eventfd of the peer | ID above `65535`, no eventfd for that ID, or the write failed |
 | Host under a `WormLoop` | A write to the eventfd has been handed to the ring | ID above `65535`, no eventfd for that ID, or no descriptor available |
 | Any | — | `hole` is `NULL`, or it has no kick (after `ReleaseWormLoop` in host mode) |
-
-The plain host kick does not check the range of `identifier`; it has to be within
-`0…65535`.
 
 **`HandleWormHoleHostServerEvent`** reads every message waiting on `host.socket`
 without blocking. A message carrying an ID and a descriptor is the eventfd of a peer:

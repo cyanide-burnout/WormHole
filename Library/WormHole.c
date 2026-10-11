@@ -69,7 +69,8 @@ static int KickHostWormHole(struct WormHole* hole, uint32_t identifier)
   value = 1ULL;
 
   return -EBADF *
-    ((hole->host.handles[identifier] < 0) ||
+    ((identifier > UINT16_MAX) ||
+     (hole->host.handles[identifier] < 0) ||
      (write(hole->host.handles[identifier], &value, sizeof(uint64_t)) <= 0));
 }
 
@@ -118,6 +119,7 @@ static struct WormHole* CreateHostWormHole(const char* path, struct stat* status
     memset(hole->host.handles, 0xff, sizeof(hole->host.handles));
 
     if ((hole->host.socket < 0) ||
+        (strlen(path) >= sizeof(address.sun_path)) ||
         (connect(hole->host.socket, (struct sockaddr*)&address, sizeof(struct sockaddr_un)) < 0)                 ||
         (ReadHostServerMessage(hole, &value, NULL, 0) < 0)               || (value  != IVSHMEM_PROTOCOL_VERSION) ||
         (ReadHostServerMessage(hole, (int64_t*)&hole->identifier, &handle, 0) < 0) || (handle != -1)             ||
@@ -127,6 +129,7 @@ static struct WormHole* CreateHostWormHole(const char* path, struct stat* status
     {
       close(hole->host.socket);
       close(hole->host.memory);
+      close(handle);
       free(hole);
       return NULL;
     }

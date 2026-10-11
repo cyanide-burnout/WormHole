@@ -83,8 +83,8 @@ kick went anywhere.
   `0`, whether a peer of that ID exists or not.
 - **Host mode.** The value `1` is written to the eventfd of the peer, and the result is
   `0`. It is `-EBADF` before the server has announced the peer, after it has announced
-  its departure, and when the write fails. The ID has to be within `0…65535`: the table
-  is that large, and this kick does not check it.
+  its departure, for an ID above `65535`, which is as large as the table of peers goes,
+  and when the write fails.
 
 A peer may kick itself in both modes. `WormArena` rings peers through `KickWormHole`, so
 all of the above holds for `KickWormArenaEntity` and `KickAllWormArenaEntities` as well.
@@ -99,8 +99,7 @@ the caller would otherwise make.
   `HandleWormHoleHostServerEvent` whenever it is readable. Once that call has produced
   `handle`, the loop adds a watch of it. The kick is replaced by an io_uring write:
   `0` then means that the write has been handed to the ring, not that it has been done;
-  the ring submits it on its next iteration and nobody sees its result. This kick does
-  check that the ID is within `0…65535`.
+  the ring submits it on its next iteration and nobody sees its result.
 
 When `handle` becomes readable the loop calls `HandleWormHoleInterruptEvent` with
 `HOLE_CLIENT_VALUE_READ`, so the bell runs inside `WaitForFastRing()` on the thread of
