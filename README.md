@@ -69,8 +69,8 @@ device and gives the memory, the ID of this peer, a way to ring another peer and
 callback for when somebody rings this one. The waiting is left to the caller.
 
 **WormLoop** ties a hole to an io_uring loop of **FastRing**, so that the doorbell
-and, in host mode, the connection to the server are watched by the loop and ringing a
-neighbour costs no syscall of its own.
+and, in host mode, the connection to the server are watched by the loop instead of
+being polled by hand.
 
 **WormArena** lays out named objects, pools of blocks and lock-free queues inside the
 region, for several processes on several machines at once, with leases and sweeps in
@@ -202,8 +202,8 @@ void ReleaseWormLoop(struct WormLoop* loop);
 
 Ties a hole to an io_uring loop of **FastRing**, and after that neither source has to
 be polled by hand: the doorbell arrives as the bell of the hole, and in host mode the
-socket of the server is watched as well. The kick is replaced by an io_uring one, so
-ringing a neighbour costs no syscall of its own.
+socket of the server is watched as well. The kick stays what it is: in both modes the
+doorbell has been rung by the time `KickWormHole` returns.
 
 The rule of a loop applies: the bell is called from inside the loop and has nothing
 to wait for there.
@@ -216,15 +216,16 @@ Every function, field and constant is listed in [API.md](Documentation/API.md).
 that, and from where each mode gets its events, are in
 [LIFECYCLE.md](Documentation/LIFECYCLE.md); in short:
 
-- **A hole belongs to its creator** and is used from one thread. A `WormLoop` and a
-  `WormArena` refer to it and never release it.
+- **A hole belongs to its creator** and is used from one thread, except for
+  `KickWormHole`, which any thread may call. A `WormLoop` and a `WormArena` refer to it
+  and never release it.
 - **A host hole is not ready when `CreateWormHole` returns.** Its event source and the
   eventfds of the peers arrive on `host.socket`, and until that has been read no bell is
   heard and no peer can be kicked.
 - **A bell says that somebody has rung and no more**: neither who nor how many times.
 - **A kick reaches a peer the server has announced** in host mode and returns `-EBADF`
-  otherwise; in guest mode it always returns `0`. Under a `WormLoop` it is an io_uring
-  write, and after `ReleaseWormLoop` a host hole has no kick at all.
+  otherwise; in guest mode it always returns `0`. In both modes the doorbell has been
+  rung by the time it returns.
 - **Losses are reported, not repaired.** A peer that leaves is dropped from the table;
   the loss of the server or of the event source is reported through `loss`, by the loop
   or by the caller, and nothing reconnects.

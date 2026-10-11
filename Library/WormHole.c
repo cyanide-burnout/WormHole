@@ -23,6 +23,8 @@
 
 #define IVSHMEM_PROTOCOL_VERSION  0
 
+#define HOST_HANDLE_BUSY          -2
+
 static int ReadHostServerMessage(struct WormHole* hole, int64_t* number, int* handle, int flags)
 {
   int result;
@@ -64,14 +66,42 @@ static int ReadHostServerMessage(struct WormHole* hole, int64_t* number, int* ha
 
 static int KickHostWormHole(struct WormHole* hole, uint32_t identifier)
 {
+  _Atomic int* slot;
   uint64_t value;
+  int expected;
+  int handle;
+  int result;
 
-  value = 1ULL;
+  if (identifier > UINT16_MAX)
+  {
+    // There is no such peer
+    return -EBADF;
+  }
 
-  return -EBADF *
-    ((identifier > UINT16_MAX) ||
-     (hole->host.handles[identifier] < 0) ||
-     (write(hole->host.handles[identifier], &value, sizeof(uint64_t)) <= 0));
+  slot = (_Atomic int*)hole->host.handles + identifier;
+
+  // Wait while another thread is kicking the same peer, then take the handle: it is ours until it
+  // is given back, nobody closes it, and its number cannot be reused for something else meanwhile
+  while (((handle = atomic_load_explicit(slot, memory_order_acquire)) == HOST_HANDLE_BUSY) ||
+         ((handle >= 0) && (!atomic_compare_exchange_weak_explicit(slot, &handle, HOST_HANDLE_BUSY, memory_order_acquire, memory_order_relaxed))));
+
+  if (handle < 0)
+  {
+    // Peer is not known or has gone
+    return -EBADF;
+  }
+
+  value    = 1ULL;
+  result   = -EBADF * (write(handle, &value, sizeof(uint64_t)) <= 0);
+  expected = HOST_HANDLE_BUSY;
+
+  if (!atomic_compare_exchange_strong_explicit(slot, &expected, handle, memory_order_release, memory_order_relaxed))
+  {
+    // Peer has gone while the handle was taken, closing it is left to us
+    close(handle);
+  }
+
+  return result;
 }
 
 static void ReleaseHostWormHole(struct WormHole* hole)
@@ -185,16 +215,20 @@ int HandleWormHoleHostServerEvent(struct WormHole* hole)
     if ((number >= 0) &&
         (number <= UINT16_MAX))
     {
-      if ((handle != -1) && (hole->host.handles[number] == -1))
+      if ((handle != -1) && (atomic_load_explicit((_Atomic int*)hole->host.handles + number, memory_order_relaxed) == -1))
       {
-        hole->host.handles[number] = handle;
+        atomic_store_explicit((_Atomic int*)hole->host.handles + number, handle, memory_order_release);
         continue;
       }
 
-      if ((handle == -1) && (hole->host.handles[number] != -1))
+      if ((handle == -1) && (atomic_load_explicit((_Atomic int*)hole->host.handles + number, memory_order_relaxed) != -1))
       {
-        close(hole->host.handles[number]);
-        hole->host.handles[number] = -1;
+        if ((handle = atomic_exchange_explicit((_Atomic int*)hole->host.handles + number, -1, memory_order_acq_rel)) >= 0)
+        {
+          // Otherwise a kick of another thread has the handle taken, and it is that kick to close it
+          close(handle);
+        }
+
         continue;
       }
     }

@@ -18,10 +18,9 @@ released. The functions are listed in [API.md](API.md), the overall model in the
 ## Threads and Ownership
 
 `WormHole` and `WormLoop` take no locks and start no threads. A hole is owned by the
-caller of `CreateWormHole`, who releases it with `ReleaseWormHole`. Nothing inside it is
-synchronized: the table of eventfds that `HandleWormHoleHostServerEvent` changes is the
-one the kick reads, so the calls on one hole are made from one thread or serialized by
-the caller.
+caller of `CreateWormHole`, who releases it with `ReleaseWormHole`. `KickWormHole` may be
+called from any thread (see [Kicks](#kicks)); every other call on one hole is made from
+one thread or serialized by the caller.
 
 A `WormLoop` and a `WormArena` refer to a hole and never release it. A loop is owned by
 the caller of `CreateWormLoop` and released with `ReleaseWormLoop`.
@@ -86,6 +85,22 @@ kick went anywhere.
   its departure, for an ID above `65535`, which is as large as the table of peers goes,
   and when the write fails.
 
+In both modes the doorbell has been rung by the time `KickWormHole` returns: in a guest
+the write to the register exits to the hypervisor, which signals the eventfd of the peer
+before the machine goes on; on the host the eventfd is written by the call itself.
+
+A kick may be made from any thread. A guest kick touches nothing but the mapping of the
+registers. A host kick shares the table of eventfds with
+`HandleWormHoleHostServerEvent`, which closes the eventfd of a peer that leaves, and the
+number of a closed descriptor is handed out again at once to whatever the process opens
+next. So a host kick takes the eventfd out of its slot for the time of the write, with
+an atomic exchange, and puts it back afterwards. A peer that leaves meanwhile finds the
+slot taken and leaves the closing to the kick, so a descriptor is never closed while it
+is being written to. Two threads kicking the same peer at once take turns at its slot,
+the second one spinning for the time of a single write. A signal handler must not kick:
+having interrupted a kick of its own thread, it would wait for that very kick to give
+the slot back, and wait for good.
+
 A peer may kick itself in both modes. `WormArena` rings peers through `KickWormHole`, so
 all of the above holds for `KickWormArenaEntity` and `KickAllWormArenaEntities` as well.
 
@@ -97,9 +112,7 @@ the caller would otherwise make.
 - **Guest mode.** The loop watches `handle` from the start. The kick is left as it is.
 - **Host mode.** The loop watches `host.socket` and calls
   `HandleWormHoleHostServerEvent` whenever it is readable. Once that call has produced
-  `handle`, the loop adds a watch of it. The kick is replaced by an io_uring write:
-  `0` then means that the write has been handed to the ring, not that it has been done;
-  the ring submits it on its next iteration and nobody sees its result.
+  `handle`, the loop adds a watch of it. The kick is left as it is.
 
 When `handle` becomes readable the loop calls `HandleWormHoleInterruptEvent` with
 `HOLE_CLIENT_VALUE_READ`, so the bell runs inside `WaitForFastRing()` on the thread of
@@ -133,12 +146,10 @@ go on creates a new hole (see [Instances](SERVER.md#instances)).
 Everything is released in the reverse order of creation:
 
 1. `ReleaseWormLoop`, while the ring still exists, since it removes its watches from it.
-   In host mode it also takes its kick away and leaves none in its place: from then on
-   `KickWormHole` on that hole returns `-EBADF`. In guest mode the kick is untouched.
+   The hole goes on working without it, but nothing reads the socket of the server any
+   more, so a host hole no longer learns of peers coming and going.
 2. `ReleaseFastRing`.
 3. `ReleaseWormArena`, while the hole still exists, since the arena lives in its memory.
-   An arena that outlives its loop goes on working on the memory, but in host mode its
-   kicks return `-EBADF`.
 4. `ReleaseWormHole`, which unmaps the region, closes every descriptor the hole holds and
    frees it. Pointers into `memory` are invalid afterwards. In host mode the closed socket
    is how the server learns that the peer has gone and tells the others.

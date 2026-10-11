@@ -61,25 +61,6 @@ static void HandleHostServerEvent(struct FastRingDescriptor* descriptor, int res
   }
 }
 
-static int KickHostWormHole(struct WormHole* hole, uint32_t identifier)
-{
-  struct WormLoop* loop;
-  struct FastRingDescriptor* descriptor;
-
-  if ((identifier <= UINT16_MAX) &&
-      (hole->host.handles[identifier] >= 0) &&
-      (loop       = (struct WormLoop*)hole->extension) &&
-      (descriptor = AllocateFastRingDescriptor(loop->ring, NULL, NULL)))
-  {
-    descriptor->data.number = 1ULL;
-    io_uring_prep_write(&descriptor->submission, hole->host.handles[identifier], &descriptor->data.number, sizeof(uint64_t), 0);
-    SubmitFastRingDescriptor(descriptor, 0);
-    return 0;
-  }
-
-  return -EBADF;
-}
-
 struct WormLoop* CreateWormLoop(struct FastRing* ring, struct WormHole* hole)
 {
   struct WormLoop* loop;
@@ -97,11 +78,7 @@ struct WormLoop* CreateWormLoop(struct FastRing* ring, struct WormHole* hole)
     {
       case HOLE_CLIENT_TYPE_HOST:
         // Own eventfd is not granted yet, event source is watched later
-        if (loop->server = AddFastRingWatch(ring, hole->host.socket, POLLIN, 0, HandleHostServerEvent, loop))
-        {
-          hole->extension = loop;
-          hole->kick      = KickHostWormHole;
-        }
+        loop->server = AddFastRingWatch(ring, hole->host.socket, POLLIN, 0, HandleHostServerEvent, loop);
         break;
 
       case HOLE_CLIENT_TYPE_GUEST:
@@ -125,18 +102,8 @@ struct WormLoop* CreateWormLoop(struct FastRing* ring, struct WormHole* hole)
 
 void ReleaseWormLoop(struct WormLoop* loop)
 {
-  struct WormHole* hole;
-
   if (loop != NULL)
   {
-    if ((hole = loop->hole) &&
-        (hole->extension == loop))
-    {
-      // Kick has to fail rather than to reach the released loop
-      hole->extension = NULL;
-      hole->kick      = NULL;
-    }
-
     RemoveFastRingWatch(loop->server);
     RemoveFastRingWatch(loop->source);
 

@@ -66,10 +66,10 @@ The fields the caller reads or sets:
 | `size` | `size_t` | How much to read from `handle`: 4 bytes in guest mode, 8 in host mode |
 | `host.socket` | `int` | Connection to *ivshmem-server*, host mode only |
 
-The rest belongs to the library: `kick`, `release` and `bell`; `extension`, which a
-`WormLoop` points at itself in host mode; `host.memory`, the descriptor of the shared
-object; `host.handles`, the eventfds of all peers by ID, `-1` where there is none; and
-`guest.registers`, the mapping of BAR0 of the device.
+The rest belongs to the library: `kick`, `release` and `bell`; `host.memory`, the
+descriptor of the shared object; `host.handles`, the eventfds of all peers by ID, `-1`
+where there is none and `-2` while a kick holds it; and `guest.registers`, the mapping of BAR0 of the device.
+`extension` is not used by the library.
 
 ### Functions
 
@@ -91,8 +91,7 @@ frees it. Accepts `NULL`.
 |------|-----|----------|
 | Guest | Always: the ID is written to the doorbell register | — |
 | Host | The value `1` has been written to the eventfd of the peer | ID above `65535`, no eventfd for that ID, or the write failed |
-| Host under a `WormLoop` | A write to the eventfd has been handed to the ring | ID above `65535`, no eventfd for that ID, or no descriptor available |
-| Any | — | `hole` is `NULL`, or it has no kick (after `ReleaseWormLoop` in host mode) |
+| Any | — | `hole` is `NULL` |
 
 **`HandleWormHoleHostServerEvent`** reads every message waiting on `host.socket`
 without blocking. A message carrying an ID and a descriptor is the eventfd of a peer:
@@ -126,9 +125,8 @@ void ReleaseWormLoop(struct WormLoop* loop);
 
 **`CreateWormLoop`** watches the sources of a hole on a ring of **FastRing**. In guest
 mode it watches `handle` at once. In host mode it watches `host.socket`, and the watch of
-`handle` is added once the server has granted it; it also points `extension` at the loop
-and replaces the kick with one that writes through the ring. Returns `NULL` when `ring`
+`handle` is added once the server has granted it. The kick is left as it is. Returns
+`NULL` when `ring`
 or `hole` is `NULL`, or when the loop cannot be allocated or its first watch added.
 
-**`ReleaseWormLoop`** removes both watches and frees the loop. In host mode it also takes
-its kick away from the hole and leaves none in its place. Accepts `NULL`.
+**`ReleaseWormLoop`** removes both watches and frees the loop. Accepts `NULL`.
