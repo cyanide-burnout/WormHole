@@ -90,6 +90,7 @@ the region once a second and ring each other; a bell prints what the other has w
 ```c
 #include <stdio.h>
 #include <stdlib.h>
+#include <signal.h>
 
 #include "FastRing.h"
 #include "WormHole.h"
@@ -118,6 +119,11 @@ static void HandleTimeout(struct FastRingDescriptor* descriptor)
   KickWormHole(hole, *peer);
 }
 
+static void HandleSignal(int signal)
+{
+  // Nothing to do here, the signal itself makes WaitForFastRing() return an error
+}
+
 int main(int count, char** arguments)
 {
   struct FastRingDescriptor* timer;
@@ -135,6 +141,8 @@ int main(int count, char** arguments)
   ring  = CreateFastRing(0);
   loop  = CreateWormLoop(ring, hole);
   timer = SetFastRingTimeout(ring, NULL, 1000, TIMEOUT_FLAG_REPEAT, HandleTimeout, hole);
+
+  signal(SIGINT, HandleSignal);
 
   while (WaitForFastRing(ring, 200, NULL) >= 0);
 
