@@ -46,8 +46,9 @@ static void HandleHostServerEvent(struct FastRingDescriptor* descriptor, int res
     if ((loop->source == NULL) &&
         (hole->handle >= 0))
     {
-      // Server has just granted an eventfd of the peer itself
-      loop->source = AddFastRingWatch(loop->ring, hole->handle, POLLIN, 0, HandleInterruptEvent, loop);
+      // Server has just granted an eventfd of the peer itself, and without a watch on it no bell is heard again
+      loop->source  = AddFastRingWatch(loop->ring, hole->handle, POLLIN, 0, HandleInterruptEvent, loop);
+      status       |= (loop->source == NULL);
     }
   }
 
