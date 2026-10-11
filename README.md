@@ -1,179 +1,155 @@
 # WormHole
 
-Linux inter-VM shared memory client library
+WormHole is a C library for Linux that lets processes on a host and inside its virtual
+machines share a region of memory and ring each other's doorbells, over *ivshmem* of
+QEMU. Both sides of that come with it: a fresh UIO driver for kernels 6.x on the side
+of a guest, and on the side of the host *ivshmem-server*, which QEMU builds out of its
+sources and installs nowhere, put under systemd with an instance per shared region.
 
-* Fresh UIO driver compatible with Linux kernels 6.x
-* Library could work
-  * in host mode using direct connection to *QEMU ivshmem-server*
-  * as well as in guest mode using UIO driver
-* Allows to run multiple instances of application in both modes
-* Server side is here as well: *ivshmem-server* is built out of QEMU sources, which
-  compile it and install it nowhere, and put under systemd with an instance per
-  shared region
-* In addition here is integration with io_uring-based main loop (see repository **FastRing**)
+- [The Problem](#the-problem)
+- [Architecture](#architecture)
+- [Getting Started](#getting-started)
+- [Library](#library)
+- [Execution and Lifecycle Contract](#execution-and-lifecycle-contract)
+- [Arena](#arena)
+- [Deployment](#deployment)
+- [Testing](#testing)
+- [Limits](#limits)
+- [Documentation](#documentation)
+- [Links](#links)
 
-## Driver
+## The Problem
 
-The UIO driver lives in `Driver/`. Building it needs the kernel headers for the
-running kernel (`linux-headers-$(uname -r)` or equivalent).
+Processes on one machine, some on the host and some in its virtual machines, can work
+on the same data in memory they share. QEMU offers that as *ivshmem*: a region backed by
+a shared object on the host and presented to a guest as a PCI device, and, with
+*ivshmem-doorbell*, a way for every participant to interrupt any other. What it leaves
+out is everything around that:
 
-Install through DKMS so the module is rebuilt automatically on kernel upgrades:
+- The server that hands out the region and the doorbells is built by QEMU and installed
+  nowhere, so no distribution carries it.
+- A guest needs a driver to reach the device from user space.
+- A program on the host speaks the protocol of the server, and a program in a guest
+  speaks to the registers of the device: two interfaces for the same thing.
+- The memory is all there is. Futexes, and with them every blocking primitive of the
+  system, do not cross the boundary of a virtual machine.
 
-```
-cd Driver
-sudo make dkms
-sudo make reload
-```
+WormHole covers each of them: `Server/` builds the server and puts it under systemd,
+`Driver/` is the UIO driver, the library is one client for both sides, and WormArena
+builds shared objects out of nothing but atomic operations and the doorbell.
 
-To remove it:
+## Architecture
 
-```
-sudo make dkms-remove   # this version
-sudo make dkms-purge    # every installed version
-```
-
-A plain one-off build without DKMS is also available, but it does not survive
-a kernel upgrade:
-
-```
-cd Driver
-make
-sudo make install
-```
-
-## Server
-
-*ivshmem-server* is the other side of host mode: it hands every peer the region
-and the eventfds of all the others. QEMU builds it out of `contrib/` and then
-installs nothing — `install: false` in its `meson.build` is the whole reason no
-distribution carries it, and the disclaimer it prints on startup is the reason
-nobody has asked them to. `Server/` takes it from there: it fetches the sources,
-builds that one binary out of them and puts it under systemd as a template unit
-with an instance per region.
+Every participant is a *peer* of one instance of *ivshmem-server*, which hands each of
+them the region and the eventfds of all the others. A process on the host connects to
+the socket of the server itself; that is *host mode*. A virtual machine is connected by
+QEMU through an *ivshmem-doorbell* device, and a process inside it opens that device
+through the UIO driver; that is *guest mode*.
 
 ```
-cd Server
-sudo ./install.sh
+  process on the host                       process in a guest
+  WormHole, host mode                       WormHole, guest mode
+          |                                         | /dev/uio0
+          |                                   uio_ivshmem (UIO driver)
+          |                                         | PCI
+          |                                   ivshmem-doorbell (QEMU)
+          | socket                                  | socket
+          +------------->  ivshmem-server  <--------+
+                    the region, an eventfd per peer
 ```
 
-QEMU is configured with everything but the tools switched off, since the server
-links against `libqemuutil` and wants nothing else, so the build is minutes
-rather than an hour. What comes out is `/usr/local/bin/ivshmem-server`,
-`/usr/local/sbin/ivshmem-server-ctl` and one instance named `default`, running on
-`/run/ivshmem-server/default.sock` with 16M of memory in `/dev/shm/ivshmem-default`.
-`ivshmem-client` is installed along with it, being useful for looking at a region
-without writing anything. `--version`, `--prefix`, `--source`, `--instance` and
-the rest are in `./install.sh --help`, and `make install FLAGS="..."` is the same
-thing said through the Makefile.
+Every peer has an ID, and a doorbell is rung by ID. Several processes may run in either
+mode at once: on the host each of them is a peer of its own, while in a guest they share
+the device and its ID, so a machine is a single peer however many processes it runs.
 
-The tarball stays in `/var/cache/ivshmem-server` so that a second run has nothing
-to download; the unpacked sources and the build tree are swept once the binary is
-installed, unless `--keep` says otherwise or `--build-only` stopped short of
-installing anything. A tree that is kept is picked up again by the next run, but
-only if it was configured from the same sources for the same prefix — otherwise
-it is thrown away and configured afresh, rather than answering `--version` with
-whatever it was built from the last time. Since all of that is read back, the
-directory has to belong to whoever is building and be closed to everybody else.
-Somewhere world-writable — `/var/tmp`, where a build tree would otherwise
-naturally go — is somewhere a tarball or a `build.ninja` can be left waiting for
-root to find, and this refuses to be that. `--work` moves it under the same rule
-and one more: the directory is marked as ours, and since that mark is what
-`uninstall.sh --purge` takes as leave to `rm -rf` the place, it is only ever put
-on a directory that was made for the build or was empty when it was taken over.
-`--work /etc` would pass every other test there is when root is the one
-building.
+Three layers sit on top of that:
 
-### Instances
+**WormHole** is the client of a region. `CreateWormHole` takes the socket or the UIO
+device and gives the memory, the ID of this peer, a way to ring another peer and a
+callback for when somebody rings this one. The waiting is left to the caller.
 
-One unit, one instance per region, one file per instance:
+**WormLoop** ties a hole to an io_uring loop of **FastRing**, so that the doorbell
+and, in host mode, the connection to the server are watched by the loop and ringing a
+neighbour costs no syscall of its own.
 
-```
-ivshmem-server-ctl add render --size 64M --group kvm
-ivshmem-server-ctl list
-ivshmem-server-ctl remove render --purge
-```
+**WormArena** lays out named objects, pools of blocks and lock-free queues inside the
+region, for several processes on several machines at once, with leases and sweeps in
+place of anything that would need a single kernel.
 
-`add` writes `/etc/ivshmem-server/render.conf`, then enables and starts
-`ivshmem-server@render`; over an instance that is already running, `--force`
-restarts it, since a file the running server never read is not a configuration.
-The file is where the socket path, the size, the number of vectors, the name of
-the shared object and the ownership of the socket live; editing it and restarting
-the instance is the whole of reconfiguring one. Two instances are not allowed
-onto one socket or one region.
+## Getting Started
 
-That file looks like shell and is deliberately not read as shell. Sourcing it
-would run whatever it held before anything could be said about it, and a check
-that comes after the execution is a check of what is left rather than of what was
-done — so it is parsed instead: `KEY=value` of a name the instance knows, quoted
-or not, and a line that is anything else stops the instance where it stands. The
-values are looked at on both sides of the file, going in and coming back out — a
-path is an absolute path, a size is digits and a suffix, a mode is three octal
-digits, the number of vectors is one to sixty-four — so a file edited into
-something strange is refused with a word about which value it was, rather than by
-the server failing oddly later on. The libvirt hook reads the socket path out the
-same way, being root inside libvirtd and no place to execute a file for the sake
-of one line of it.
+There is no build system for the library: its sources are compiled into the application,
+as the tests do. `WormHole.c` needs nothing but libc; `WormLoop.c` needs `FastRing.c` of
+**FastRing** and liburing; `WormArena.c` needs `HashMap` and `CRC32C` of the Toolkit of
+TetraPack. The guest needs the driver and the host a running server (see
+[Deployment](#deployment)).
 
-The socket is bound owned by root and by default reachable by nobody else, so the
-instance is given a group once it is up — `kvm` on Debian, which is what libvirt
-runs QEMU under, and `qemu` where that is the name instead. A host client of your
-own has to be in that group or be root.
+Two peers, each given the path of its side and the ID of the other, write a line into
+the region once a second and ring each other; a bell prints what the other has written:
 
-A socket left over from a server that was killed rather than stopped is taken
-away at the next start — but only after `ss` has been asked and has answered that
-nothing is serving it. `ss` missing, `ss` failing and `ss` answering nothing at
-all are three ways of not having been told, and none of them is an answer: an
-instance that finds a socket it cannot account for stops and says so instead of
-unlinking one somebody may be serving. That is what `iproute2` is doing among the
-dependencies.
+```c
+#include <stdio.h>
+#include <stdlib.h>
 
-Restarting an instance hands out a *new* region: the server unlinks the shared
-object as it goes down, and neither a guest nor a host client reconnects on its
-own. That is why the unit does not restart itself on failure — coming back up
-quietly would leave everything attached talking to nothing.
+#include "FastRing.h"
+#include "WormHole.h"
+#include "WormLoop.h"
 
-### What libvirt will not do for you
+#define SLOT_SIZE  64
 
-It will not wait. A `<shmem>` device turns into a client `-chardev socket`, and
-QEMU connects to it while the device is being realized, blocking there for the
-protocol handshake that carries the file descriptor of the region. There is no
-retry and no timeout to wait out: if the socket is not there, the domain does not
-start, and libvirt reports what QEMU said about the connection.
+static void HandleBell(struct WormHole* hole)
+{
+  uint32_t* peer;
 
-So the server has to be up first. At boot that is what the ordering in the unit
-is for — instances are `Before=libvirtd.service virtqemud.service
-libvirt-guests.service`, which covers the domains libvirt autostarts. For a
-domain started by hand later, or on a host where the instance is not enabled,
-there is a hook:
+  // A bell does not say who rang, what has changed is found in the memory
+  peer = (uint32_t*)hole->closure;
+  printf("%s\n", (char*)hole->memory + *peer * SLOT_SIZE);
+}
 
-```
-sudo ./install.sh --hook
-sudo systemctl restart virtqemud libvirtd
+static void HandleTimeout(struct FastRingDescriptor* descriptor)
+{
+  struct WormHole* hole;
+  uint32_t* peer;
+
+  hole = (struct WormHole*)descriptor->closure;
+  peer = (uint32_t*)hole->closure;
+
+  snprintf((char*)hole->memory + hole->identifier * SLOT_SIZE, SLOT_SIZE, "Hello from %u", (uint32_t)hole->identifier);
+  KickWormHole(hole, *peer);
+}
+
+int main(int count, char** arguments)
+{
+  struct FastRingDescriptor* timer;
+  struct FastRing* ring;
+  struct WormHole* hole;
+  struct WormLoop* loop;
+  uint32_t peer;
+
+  // The socket of ivshmem-server on the host, /dev/uio0 in a guest
+  peer = strtoul(arguments[2], NULL, 10);
+  hole = CreateWormHole(arguments[1], HandleBell, &peer);
+
+  printf("This is peer %u\n", (uint32_t)hole->identifier);
+
+  ring  = CreateFastRing(0);
+  loop  = CreateWormLoop(ring, hole);
+  timer = SetFastRingTimeout(ring, NULL, 1000, TIMEOUT_FLAG_REPEAT, HandleTimeout, hole);
+
+  while (WaitForFastRing(ring, 200, NULL) >= 0);
+
+  // Reverse order: the loop goes while the ring is still there, the hole goes last
+  SetFastRingTimeout(ring, timer, -1, 0, NULL, NULL);
+  ReleaseWormLoop(loop);
+  ReleaseFastRing(ring);
+  ReleaseWormHole(hole);
+
+  return EXIT_SUCCESS;
+}
 ```
 
-It goes to `/etc/libvirt/hooks/qemu`, runs at `prepare/begin` — before QEMU is
-spawned, with libvirt waiting on it — reads the domain XML, and starts the
-instance every `<shmem>` of that domain points at. A socket that belongs to no
-instance of ours it leaves alone. If one already lives at that path, the hook is
-installed next to it as `qemu.ivshmem` for you to call yourself. libvirt reads
-its hooks when the daemon starts, which is what the restart is for; running
-domains are not disturbed by it.
-
-The domain side is the ordinary thing:
-
-```xml
-<shmem name='ivshmem-default'>
-  <model type='ivshmem-doorbell'/>
-  <size unit='M'>16</size>
-  <server path='/run/ivshmem-server/default.sock'/>
-  <msi vectors='1'/>
-</shmem>
-```
-
-One vector, because that is all the UIO driver can make use of. On a host with
-AppArmor, `/run/...` is outside what the generated profile grants a domain; if
-the domain is denied the socket, either put it where the profile reaches or add
-the path to `/etc/apparmor.d/local/abstractions/libvirt-qemu`.
+In host mode the first kicks may return `-EBADF`: the peers become known only once the
+loop has read the socket of the server. `Test/Hole` is the full version of this.
 
 ## Library
 
@@ -224,11 +200,64 @@ ringing a neighbour costs no syscall of its own.
 The rule of a loop applies: the bell is called from inside the loop and has nothing
 to wait for there.
 
+Every function, field and constant is listed in [API.md](Documentation/API.md).
+
+## Execution and Lifecycle Contract
+
+`WormHole` and `WormLoop` take no locks and start no threads. The rules that follow from
+that, and from where each mode gets its events, are in
+[LIFECYCLE.md](Documentation/LIFECYCLE.md); in short:
+
+- **A hole belongs to its creator** and is used from one thread. A `WormLoop` and a
+  `WormArena` refer to it and never release it.
+- **A host hole is not ready when `CreateWormHole` returns.** Its event source and the
+  eventfds of the peers arrive on `host.socket`, and until that has been read no bell is
+  heard and no peer can be kicked.
+- **A bell says that somebody has rung and no more**: neither who nor how many times.
+- **A kick reaches a peer the server has announced** in host mode and returns `-EBADF`
+  otherwise; in guest mode it always returns `0`. Under a `WormLoop` it is an io_uring
+  write, and after `ReleaseWormLoop` a host hole has no kick at all.
+- **Losses are reported, not repaired.** A peer that leaves is dropped from the table;
+  the loss of the server or of the event source is reported through `loss`, by the loop
+  or by the caller, and nothing reconnects.
+- **Release goes in reverse**: the loop before the ring, the arena before the hole.
+
 ## Arena
 
 On top of the library there is **WormArena** — a store of named objects, pools of
 blocks and lock-free queues laid out inside the shared memory, meant to be used by
-several processes on several machines at once. See [Arena.md](Arena.md).
+several processes on several machines at once. See [ARENA.md](Documentation/ARENA.md).
+
+## Deployment
+
+### Guest
+
+A virtual machine needs an *ivshmem-doorbell* device connected to an instance of the
+server, and inside it the UIO driver in `Driver/`, built against the headers of the
+running kernel and installed through DKMS so that it is rebuilt on kernel upgrades:
+
+```
+cd Driver
+sudo make dkms
+sudo make reload
+```
+
+Attaching the device by QEMU or libvirt, removing the driver or building it without
+DKMS, what it makes of the device and how to check the result are described in
+[Documentation/GUEST.md](Documentation/GUEST.md).
+
+### Server
+
+Host mode needs *ivshmem-server*, which no distribution carries. `Server/` builds it out
+of the QEMU sources and puts it under systemd with an instance per region:
+
+```
+cd Server
+sudo ./install.sh
+```
+
+The build, the instances and their configuration, and what has to be done for libvirt
+are described in [Documentation/SERVER.md](Documentation/SERVER.md).
 
 ## Testing
 
@@ -246,7 +275,8 @@ make && ./arena
 against *ivshmem-server*, `test.sh 2` builds a guest image and boots it with
 *ivshmem-doorbell* so that the guest talks to the host through the driver.
 *ivshmem-server* is not packaged by Debian; `Server/` builds it out of the
-`contrib/` directory of QEMU and puts it under systemd.
+`contrib/` directory of QEMU and puts it under systemd, as described in
+[Documentation/SERVER.md](Documentation/SERVER.md).
 
 `Test/Smoke` puts the arena over that same real region. Every peer is given the path
 of the socket or of the UIO device, a name of its own, a number of seconds and how
@@ -316,6 +346,19 @@ and the peers are forks of one process.
 
 * Only one IRQ vector is supported because of UIO limits
 * Due to byte-order depended implementation of ivshmem in QEMU a guest system should use the same byte-order as a host
+
+## Documentation
+
+- [API.md](Documentation/API.md): functions, fields, constants and callbacks of
+  `WormHole` and `WormLoop`.
+- [LIFECYCLE.md](Documentation/LIFECYCLE.md): ownership, coming up in each mode, peers,
+  bells, kicks, losses and release.
+- [ARENA.md](Documentation/ARENA.md): the model, the interface and the rules of
+  `WormArena`.
+- [GUEST.md](Documentation/GUEST.md): attaching the device by QEMU or libvirt, building and
+  installing the UIO driver, what it does, and checking the result.
+- [SERVER.md](Documentation/SERVER.md): building *ivshmem-server*, its instances under
+  systemd, and libvirt.
 
 ## Links
 
