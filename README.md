@@ -98,13 +98,16 @@ the region once a second and ring each other; a bell prints what the other has w
 
 #define SLOT_SIZE  64
 
-static void HandleBell(struct WormHole* hole)
+static void HandleEvent(struct WormHole* hole, int event, int value)
 {
   uint32_t* peer;
 
-  // A bell does not say who rang, what has changed is found in the memory
-  peer = (uint32_t*)hole->closure;
-  printf("%s\n", (char*)hole->memory + *peer * SLOT_SIZE);
+  if (event == HOLE_EVENT_BELL)
+  {
+    // A bell does not say who rang, what has changed is found in the memory
+    peer = (uint32_t*)hole->closure;
+    printf("%s\n", (char*)hole->memory + *peer * SLOT_SIZE);
+  }
 }
 
 static void HandleTimeout(struct FastRingDescriptor* descriptor)
@@ -134,7 +137,7 @@ int main(int count, char** arguments)
 
   // The socket of ivshmem-server on the host, /dev/uio0 in a guest
   peer = strtoul(arguments[2], NULL, 10);
-  hole = CreateWormHole(arguments[1], HandleBell, &peer);
+  hole = CreateWormHole(arguments[1], HandleEvent, &peer);
 
   printf("This is peer %u\n", (uint32_t)hole->identifier);
 
@@ -157,20 +160,23 @@ int main(int count, char** arguments)
 ```
 
 In host mode the first kicks may return `-EBADF`: the peers become known only once the
-loop has read the socket of the server. `Test/Hole` is the full version of this.
+loop has read the socket of the server, which `HOLE_EVENT_READY` announces. `Test/Hole`
+is the full version of this.
 
 ## Library
 
 ### WormHole
 
 ```c
-struct WormHole* CreateWormHole(const char* path, HandleWormHoleBellFunction function, void* closure);
+struct WormHole* CreateWormHole(const char* path, HandleWormHoleEventFunction function, void* closure);
 void ReleaseWormHole(struct WormHole* hole);
 
 int KickWormHole(struct WormHole* hole, uint32_t identifier);
 
-int HandleWormHoleHostServerEvent(struct WormHole* hole);
-void HandleWormHoleInterruptEvent(struct WormHole* hole, int64_t value);
+int HandleWormHoleServerEvent(struct WormHole* hole);
+void HandleWormHoleBellEvent(struct WormHole* hole, int64_t value);
+
+#define IsWormHoleReady(hole)
 ```
 
 `CreateWormHole` picks the mode by what `path` turns out to be: a character device
@@ -179,15 +185,18 @@ host one. Everything below that difference is the same for both.
 
 What the caller gets to use is `memory` and `length` — the shared region itself —
 and `identifier`, the ID of this peer among the others. `KickWormHole` rings the
-doorbell of a peer by its ID, and the `function` given at creation is called when
-somebody rings ours.
+doorbell of a peer by its ID, and the `function` given at creation is told of events:
+`HOLE_EVENT_BELL` when somebody rings ours, `HOLE_EVENT_LOST` when a source is gone and,
+in host mode, `HOLE_EVENT_READY` once the hole can hear bells and kick its peers.
+`IsWormHoleReady` says the latter at any moment; in guest mode a hole is ready as soon as
+it is created.
 
 Waiting is left to the caller: `handle` is the event source to poll and `size` is
 how much to read from it. Having read a value, hand it to
-`HandleWormHoleInterruptEvent`; hand it `HOLE_CLIENT_VALUE_READ` instead to have the
+`HandleWormHoleBellEvent`; hand it `HOLE_CLIENT_VALUE_READ` instead to have the
 source read for you. In host mode the connection to the server is a second source,
 `host.socket`, and everything that arrives on it is for
-`HandleWormHoleHostServerEvent` — that is how the peers coming and going become
+`HandleWormHoleServerEvent` — that is how the peers coming and going become
 known.
 
 A peer may ring itself, and the mode makes no difference to that: on a host several
@@ -221,14 +230,15 @@ that, and from where each mode gets its events, are in
   and never release it.
 - **A host hole is not ready when `CreateWormHole` returns.** Its event source and the
   eventfds of the peers arrive on `host.socket`, and until that has been read no bell is
-  heard and no peer can be kicked.
+  heard and no peer can be kicked. `HOLE_EVENT_READY` says when that is over, and
+  `IsWormHoleReady` tells it at any moment.
 - **A bell says that somebody has rung and no more**: neither who nor how many times.
 - **A kick reaches a peer the server has announced** in host mode and returns `-EBADF`
   otherwise; in guest mode it always returns `0`. In both modes the doorbell has been
   rung by the time it returns.
 - **Losses are reported, not repaired.** A peer that leaves is dropped from the table;
-  the loss of the server or of the event source is reported through `loss`, by the loop
-  or by the caller, and nothing reconnects.
+  the loss of the server or of the event source is reported with `HOLE_EVENT_LOST`, by
+  the loop or by the caller, and nothing reconnects.
 - **Release goes in reverse**: the loop before the ring, the arena before the hole.
 
 ## Arena
@@ -273,7 +283,7 @@ are described in [Documentation/SERVER.md](Documentation/SERVER.md).
 `Test/Arena` needs neither the driver nor a server: an anonymous shared mapping
 stands in for ivshmem and `fork` for the peers. It covers the layout and the leases,
 the pools, the queues and the descriptors, and four ways of a peer dying in the
-middle of something — 72 checks in all.
+middle of something — 93 checks in all.
 
 ```
 cd Test/Arena
@@ -312,6 +322,29 @@ kernel, was measured taking two thirds of everything, while a peer of a guest, w
 waits on a doorbell through a virtual machine exit, took none of it at all. The
 report also counts how often taking failed on a slot a producer had claimed and not
 yet filled in, which is the other way a queue can look empty when it is not.
+
+`Test/Stress` is about the kick of a host hole from several threads while peers come
+and go. Threads kick every peer they find, over and over, while the main thread reads
+the messages of the server; two scripts connect and disconnect as fast as the server
+lets them. The eventfd of a peer that leaves is closed, and its number goes at once to
+whatever the process opens next, so after every pass over the messages the main thread
+opens an eventfd of its own to take that number: a kick that wrote into a descriptor
+that was no longer the peer's shows up in it. At the end the open descriptors are
+counted against what should be open, which is how a descriptor lost or closed twice
+would show up.
+
+```
+cd Test/Stress
+./test.sh 30
+```
+
+Without a socket the script starts `server.py`, a stand-in for *ivshmem-server* that
+needs nothing but Python; given the socket of a running server, it uses that one. The
+test puts a `write()` of its own in front of the one of libc, for `WormHole.o` as well,
+which delays every kick by 50 µs between taking the number of an eventfd and writing to
+it. Without that the race it is looking for is a few instructions wide and shows up once
+in half a minute, if at all; with it, the code before the kick took the eventfd out
+of its slot wrote 15 kicks into descriptors of somebody else within 20 seconds.
 
 ### What has been run
 
@@ -358,7 +391,7 @@ and the peers are forks of one process.
 
 ## Documentation
 
-- [API.md](Documentation/API.md): functions, fields, constants and callbacks of
+- [API.md](Documentation/API.md): functions, fields, constants and events of
   `WormHole` and `WormLoop`.
 - [LIFECYCLE.md](Documentation/LIFECYCLE.md): ownership, coming up in each mode, peers,
   bells, kicks, losses and release.

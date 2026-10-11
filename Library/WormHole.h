@@ -15,10 +15,16 @@ extern "C"
 
 #define HOLE_CLIENT_VALUE_READ  INT64_MIN
 
+#define HOLE_EVENT_READY        0  // Host mode only: the server has granted the event source, value is the ID of this peer
+#define HOLE_EVENT_LOST         1  // Value is HOLE_LOST_SERVER or HOLE_LOST_SOURCE
+#define HOLE_EVENT_BELL         2  // Value is 0
+
+#define HOLE_LOST_SERVER        0
+#define HOLE_LOST_SOURCE        1
+
 struct WormHole;
 
-typedef void (*HandleWormHoleBellFunction)(struct WormHole* hole);
-typedef void (*HandleWormHoleLossFunction)(struct WormHole* hole);
+typedef void (*HandleWormHoleEventFunction)(struct WormHole* hole, int event, int value);
 typedef void (*ReleaseWormHoleFunction)(struct WormHole* hole);
 typedef int (*KickWormHoleFunction)(struct WormHole* hole, uint32_t identifier);
 
@@ -41,8 +47,7 @@ struct WormHole
   void* extension;
   KickWormHoleFunction kick;
   ReleaseWormHoleFunction release;
-  HandleWormHoleBellFunction bell;
-  HandleWormHoleLossFunction loss;
+  HandleWormHoleEventFunction event;
 
   uint64_t identifier;  // Local peer ID
   uint8_t* memory;      // Pointer to shared memory
@@ -57,11 +62,13 @@ struct WormHole
   };
 };
 
-struct WormHole* CreateWormHole(const char* path, HandleWormHoleBellFunction function, void* closure);
+#define IsWormHoleReady(hole)  ((hole)->handle >= 0)
 
-int HandleWormHoleHostServerEvent(struct WormHole* hole);
-void HandleWormHoleInterruptEvent(struct WormHole* hole, int64_t value);
-void HandleWormHoleLossEvent(struct WormHole* hole);
+struct WormHole* CreateWormHole(const char* path, HandleWormHoleEventFunction function, void* closure);
+
+int HandleWormHoleServerEvent(struct WormHole* hole);
+void HandleWormHoleBellEvent(struct WormHole* hole, int64_t value);
+void HandleWormHoleLossEvent(struct WormHole* hole, int value);
 
 static inline __attribute__((always_inline)) int KickWormHole(struct WormHole* hole, uint32_t identifier)
 {

@@ -1437,9 +1437,25 @@ int RegisterWormArenaEntity(struct WormArena* arena, const char* name, int valid
 
     SweepArena(arena);
 
+    // A name stands for one peer. It is how a peer is found to be addressed, and of two
+    // that went by the same name only the first would ever be found: the second would be
+    // rung and written to by nobody, without either of them knowing
+
+    for (number = 1; (number < WORM_ARENA_ENTITIES) && (result == -ENOMEM); number ++)
+    {
+      entity = magic->entities + number;
+
+      if ((atomic_load_explicit(&entity->time, memory_order_acquire) >= time) &&
+          (strncmp(entity->name, name, sizeof(entity->name) - 1) == 0))
+      {
+        // The name is taken by somebody alive
+        result = -EEXIST;
+      }
+    }
+
     // The slot zero is never handed out, its bit in a block belongs to the queues
 
-    for (number = 1; number < WORM_ARENA_ENTITIES; number ++)
+    for (number = 1; (number < WORM_ARENA_ENTITIES) && (result == -ENOMEM); number ++)
     {
       entity = magic->entities + number;
 

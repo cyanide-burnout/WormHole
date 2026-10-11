@@ -4,6 +4,7 @@
 Test/Hole/test
 Test/Arena/arena
 Test/Smoke/smoke
+Test/Stress/stress
 *.o
 *.d
 *.so

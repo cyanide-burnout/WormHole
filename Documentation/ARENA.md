@@ -211,7 +211,11 @@ application from the region of another. A region that carries neither zero nor a
 signature of this version of the layout is refused at once.
 
 `RegisterWormArenaEntity` takes a slot and publishes a lease of `valid`
-milliseconds. It can be called once per arena.
+milliseconds. It can be called once per arena. A name already taken by an entity whose
+lease has not run out is refused with `-EEXIST`: the name is how a peer is found, and of
+two going by one name only the first would ever be. A peer that has let go of its arena
+has given its lease back and its name is free at once; one that has died holds it until
+the lease runs out.
 
 `QuiesceWormArena` says that this peer is going and is not to be addressed any more.
 `CheckWormArenaQuiescence` answers zero once nobody can still be addressing it,
@@ -253,6 +257,11 @@ address handed over to somebody else in the meantime.
 rung. It rings every address once and not once per entity behind it: all the
 processes of one guest share the single device of it and answer at one address, so
 ringing per entity would wake that guest as many times as it has processes.
+
+The arena does not listen to the doorbell itself. On `HOLE_EVENT_BELL` a peer takes what
+has arrived out of its queues and asks `CheckWormArenaDescriptor` about the objects it
+holds, and neither of those touches a map, so there is nothing of the arena to call on
+that path.
 
 ### Collections
 
@@ -359,12 +368,8 @@ lays it out, zeroes it once and never looks into it again.
 Every table is aligned to a cache line and every entry of it is a multiple of one, so
 no two of them are ever shared between peers.
 
-## What is not done yet
-
-* The doorbell is not wired to anything, so a peer looks around when it decides to.
-  There is nothing of the arena to call on that path, though: a peer takes what has
-  arrived out of its queues and asks `CheckWormArenaDescriptor` about the objects it
-  holds, and neither of those touches a map.
-* `HandleWormArenaEntityChange` is declared and never called.
-* Collections can not be deleted, and the area of a deleted one would not be reused.
-* Registration does not check whether the name is taken by somebody alive.
+Collections live as long as the arena, by design. Processes lay out the set of objects
+they work with once, and whatever fits, fits; what comes and goes afterwards comes and
+goes inside a pool, as blocks taken and given back. A process that needs more room for an
+object gives the pool blocks large enough for it and names them, rather than asking the
+arena for a collection of its own.

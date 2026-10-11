@@ -36,13 +36,16 @@ guest has no connection to a server and is never told which other peers there ar
 messages while still inside the call: the version of the protocol, the ID of this peer
 and the descriptor of the shared object, which it maps. What the server sends after that
 — the eventfds of the peers already there and then those of this peer itself — is left
-on the socket. Until `HandleWormHoleHostServerEvent` has read it, `handle` is `-1`, no
+on the socket. Until `HandleWormHoleServerEvent` has read it, `handle` is `-1`, no
 bell can be heard and no peer can be kicked. A host client is therefore not ready when
-`CreateWormHole` returns but after its socket has been read for the first time.
+`CreateWormHole` returns but after its socket has been read for the first time. That
+moment is announced with `HOLE_EVENT_READY`, called by `HandleWormHoleServerEvent`
+after it has read the eventfd of this peer, and `IsWormHoleReady` tells it at any time.
+A guest hole is ready from the start and gets no such event.
 
 ## Peers Coming and Going
 
-Only a host hole learns about peers, and only from `HandleWormHoleHostServerEvent`.
+Only a host hole learns about peers, and only from `HandleWormHoleServerEvent`.
 
 - A peer that connects is announced with its eventfds. The first one is kept in the
   table under its ID, and kicks to that ID reach it from then on. The server sends one
@@ -53,7 +56,7 @@ Only a host hole learns about peers, and only from `HandleWormHoleHostServerEven
 - A peer that disconnects is announced with its ID alone. Its eventfd is closed and
   kicks to that ID return `-EBADF` from then on.
 
-No callback is called for a peer coming or going. Whether the process behind a peer is
+No event is reported for a peer coming or going. Whether the process behind a peer is
 still alive is not something a hole knows either; in an arena that is what the lease is
 for (see [Lifetime](ARENA.md#lifetime)).
 
@@ -61,14 +64,15 @@ for (see [Lifetime](ARENA.md#lifetime)).
 
 A bell comes from `handle`: the UIO device in guest mode, the eventfd of the peer itself
 in host mode. The caller waits for it to become readable and calls
-`HandleWormHoleInterruptEvent`, either with the value it has read or with
-`HOLE_CLIENT_VALUE_READ` to have the source read there. The bell is called after that,
-in the thread that called `HandleWormHoleInterruptEvent`.
+`HandleWormHoleBellEvent`, either with the value it has read or with
+`HOLE_CLIENT_VALUE_READ` to have the source read there, in which case a read that
+yields nothing rings no bell. The function is called with `HOLE_EVENT_BELL` after that,
+in the thread that called `HandleWormHoleBellEvent`.
 
 A bell names neither the peer that rang nor how many times it did. A read of the source
 wakes for all the kicks since the previous one, so several kicks may arrive as one bell,
-and the value read is not handed to the callback. A bell says that somebody has rung and
-no more; what has changed is for the callback to find out in the memory.
+and the value read is not handed to the function. A bell says that somebody has rung and
+no more; what has changed is for the function to find out in the memory.
 
 In guest mode every process that holds the device is woken by an interrupt, not only the
 first of them, and all of them share the ID of the machine.
@@ -88,10 +92,13 @@ kick went anywhere.
 In both modes the doorbell has been rung by the time `KickWormHole` returns: in a guest
 the write to the register exits to the hypervisor, which signals the eventfd of the peer
 before the machine goes on; on the host the eventfd is written by the call itself.
+Whatever has been written to the region before the kick is seen by the peer that hears
+it: the write to the register is a release store, and the write to an eventfd is a
+system call.
 
 A kick may be made from any thread. A guest kick touches nothing but the mapping of the
 registers. A host kick shares the table of eventfds with
-`HandleWormHoleHostServerEvent`, which closes the eventfd of a peer that leaves, and the
+`HandleWormHoleServerEvent`, which closes the eventfd of a peer that leaves, and the
 number of a closed descriptor is handed out again at once to whatever the process opens
 next. So a host kick takes the eventfd out of its slot for the time of the write, with
 an atomic exchange, and puts it back afterwards. A peer that leaves meanwhile finds the
@@ -111,32 +118,38 @@ the caller would otherwise make.
 
 - **Guest mode.** The loop watches `handle` from the start. The kick is left as it is.
 - **Host mode.** The loop watches `host.socket` and calls
-  `HandleWormHoleHostServerEvent` whenever it is readable. Once that call has produced
+  `HandleWormHoleServerEvent` whenever it is readable. Once that call has produced
   `handle`, the loop adds a watch of it. The kick is left as it is.
 
-When `handle` becomes readable the loop calls `HandleWormHoleInterruptEvent` with
+When `handle` becomes readable the loop calls `HandleWormHoleBellEvent` with
 `HOLE_CLIENT_VALUE_READ`, so the bell runs inside `WaitForFastRing()` on the thread of
 the ring, as every watch callback of FastRing does. It has nothing to wait for there.
 
 ## Losses
 
 A loss is the end of a source: the connection to the server, or the source of bells.
-It is reported through the `loss` field of the hole, which the caller assigns after
-`CreateWormHole`, and `HandleWormHoleLossEvent`, which calls it.
+It is reported with `HOLE_EVENT_LOST`, by `HandleWormHoleLossEvent`, which calls the
+function given to `CreateWormHole` with what has been lost: `HOLE_LOST_SERVER` or
+`HOLE_LOST_SOURCE`.
 
-**Without a loop** nothing is called on its own. `HandleWormHoleHostServerEvent` returns
-`1` once everything waiting has been read, `0` when the server has closed the connection
-and `-1` on an error, and what to make of the last two is up to the caller, including
-whether to call `HandleWormHoleLossEvent`.
+**Without a loop** the loss of the server is reported by `HandleWormHoleServerEvent`
+itself: it returns `1` once everything waiting has been read, `0` when the server has
+closed the connection and `-1` on an error, and in the last two cases reports
+`HOLE_LOST_SERVER` before it returns. The loss of the source of bells shows only as reads
+of `handle` that fail; whether to call `HandleWormHoleLossEvent` for it is up to the
+caller.
 
-**Under a loop** the loss is called on the thread of the ring:
+**Under a loop** the loss is reported on the thread of the ring:
 
-- when the watch of `host.socket` reports an error, a hangup or an invalid descriptor,
-  when `HandleWormHoleHostServerEvent` returns `0` or less, or when the watch of `handle`
-  cannot be added. The watch of the socket is removed first.
-- when the watch of `handle` reports an error, a hangup or an invalid descriptor. That
-  watch is removed first. In host mode, a later message of the server puts a new watch on
-  `handle`.
+- with `HOLE_LOST_SERVER` when the watch of `host.socket` reports an error, a hangup or
+  an invalid descriptor, when `HandleWormHoleServerEvent` returns `0` or less, having
+  reported it already, or when the watch of `handle` cannot be added. The watch of the
+  socket is removed, and the loss is reported once.
+- with `HOLE_LOST_SOURCE` when the watch of `handle` reports an error, a hangup or an
+  invalid descriptor. In guest mode that is the only loss there is, and it takes the
+  device being unplugged from the running machine: UIO then answers every poll of it with
+  an error. That watch is removed first, and the loss is final: the source is watched only at the
+  moment it is granted, never again after.
 
 Nothing reconnects. A restarted server hands out a new region, so a client that wants to
 go on creates a new hole (see [Instances](SERVER.md#instances)).

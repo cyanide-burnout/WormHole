@@ -130,7 +130,7 @@ static void ReleaseHostWormHole(struct WormHole* hole)
   free(hole);
 }
 
-static struct WormHole* CreateHostWormHole(const char* path, struct stat* status, HandleWormHoleBellFunction function, void* closure)
+static struct WormHole* CreateHostWormHole(const char* path, struct stat* status, HandleWormHoleEventFunction function, void* closure)
 {
   struct sockaddr_un address;
   struct WormHole* hole;
@@ -167,7 +167,7 @@ static struct WormHole* CreateHostWormHole(const char* path, struct stat* status
     hole->type    = HOLE_CLIENT_TYPE_HOST;
     hole->release = ReleaseHostWormHole;
     hole->kick    = KickHostWormHole;
-    hole->bell    = function;
+    hole->event   = function;
     hole->closure = closure;
     hole->length  = status->st_size;
     hole->size    = sizeof(uint64_t);
@@ -176,11 +176,15 @@ static struct WormHole* CreateHostWormHole(const char* path, struct stat* status
   return hole;
 }
 
-int HandleWormHoleHostServerEvent(struct WormHole* hole)
+int HandleWormHoleServerEvent(struct WormHole* hole)
 {
   int64_t number;
   int handle;
   int result;
+  int ready;
+
+  ready  = 0;
+  result = 0;
 
   while (hole->type == HOLE_CLIENT_TYPE_HOST)
   {
@@ -198,10 +202,10 @@ int HandleWormHoleHostServerEvent(struct WormHole* hole)
       if ((result < 0) && (errno == EAGAIN))
       {
         // Socket buffer is empty, that is an normal case
-        return 1;
+        result = 1;
       }
 
-      return result;
+      break;
     }
 
     if ((hole->identifier == number) &&
@@ -210,6 +214,7 @@ int HandleWormHoleHostServerEvent(struct WormHole* hole)
       // It is allowed to trigger itself to unify behavior between host and guest modes:
       // In case of guest mode it's suitable to communicate between multiple clients on the same host
       hole->handle = dup(handle);
+      ready        = (hole->handle >= 0);
     }
 
     if ((number >= 0) &&
@@ -240,7 +245,21 @@ int HandleWormHoleHostServerEvent(struct WormHole* hole)
     }
   }
 
-  return 0;
+  if ((ready != 0) &&
+      (hole->event != NULL))
+  {
+    // Own eventfd is in the table by now, after the ones of the peers that were there before
+    hole->event(hole, HOLE_EVENT_READY, hole->identifier);
+  }
+
+  if ((hole->type == HOLE_CLIENT_TYPE_HOST) &&
+      (result     <= 0))
+  {
+    // Server has closed the connection or it has failed, there is nothing to expect anymore
+    HandleWormHoleLossEvent(hole, HOLE_LOST_SERVER);
+  }
+
+  return result;
 }
 
 // Guest mode client
@@ -275,8 +294,9 @@ static int ReadSystemValue(struct stat* status, const char* parameter, char* buf
 
 static int KickGuestWormHole(struct WormHole* hole, uint32_t identifier)
 {
+  // Whatever has been written to the region before has to be seen by the peer that hears the bell
   identifier <<= 16;
-  atomic_store_explicit((_Atomic uint32_t*)hole->guest.registers + IVSHMEM_REGISTER_DOORBELL, identifier, memory_order_relaxed);
+  atomic_store_explicit((_Atomic uint32_t*)hole->guest.registers + IVSHMEM_REGISTER_DOORBELL, identifier, memory_order_release);
   return 0;
 }
 
@@ -288,7 +308,7 @@ static void ReleaseGuestWormHole(struct WormHole* hole)
   free(hole);
 }
 
-static struct WormHole* CreateGuestWormHole(const char* path, struct stat* status, HandleWormHoleBellFunction function, void* closure)
+static struct WormHole* CreateGuestWormHole(const char* path, struct stat* status, HandleWormHoleEventFunction function, void* closure)
 {
   struct WormHole* hole;
   char buffer[64];
@@ -314,7 +334,7 @@ static struct WormHole* CreateGuestWormHole(const char* path, struct stat* statu
     hole->type       = HOLE_CLIENT_TYPE_GUEST;
     hole->release    = ReleaseGuestWormHole;
     hole->kick       = KickGuestWormHole;
-    hole->bell       = function;
+    hole->event      = function;
     hole->closure    = closure;
     hole->identifier = hole->guest.registers[IVSHMEM_REGISTER_POSITION];
     hole->size       = sizeof(uint32_t);
@@ -325,7 +345,7 @@ static struct WormHole* CreateGuestWormHole(const char* path, struct stat* statu
 
 // Exported interface
 
-struct WormHole* CreateWormHole(const char* path, HandleWormHoleBellFunction function, void* closure)
+struct WormHole* CreateWormHole(const char* path, HandleWormHoleEventFunction function, void* closure)
 {
   struct stat status;
 
@@ -347,26 +367,28 @@ struct WormHole* CreateWormHole(const char* path, HandleWormHoleBellFunction fun
   return NULL;
 }
 
-void HandleWormHoleInterruptEvent(struct WormHole* hole, int64_t value)
+void HandleWormHoleBellEvent(struct WormHole* hole, int64_t value)
 {
-  if (value == HOLE_CLIENT_VALUE_READ)
+  if ((value == HOLE_CLIENT_VALUE_READ) &&
+      (read(hole->handle, &value, hole->size) <= 0))
   {
-    // Main loop can use blocking I/O or could be (e)poll-based
-    read(hole->handle, &value, hole->size);
+    // Main loop can use blocking I/O or could be (e)poll-based, but a source that has
+    // not been granted yet or has nothing to give rings no bell
+    return;
   }
 
-  if (hole->bell != NULL)
+  if (hole->event != NULL)
   {
-    // Bell could be unused
-    hole->bell(hole);
+    // Event handler could be unused
+    hole->event(hole, HOLE_EVENT_BELL, 0);
   }
 }
 
-void HandleWormHoleLossEvent(struct WormHole* hole)
+void HandleWormHoleLossEvent(struct WormHole* hole, int value)
 {
-  if (hole->loss != NULL)
+  if (hole->event != NULL)
   {
-    // Loss could be unused
-    hole->loss(hole);
+    // Event handler could be unused
+    hole->event(hole, HOLE_EVENT_LOST, value);
   }
 }

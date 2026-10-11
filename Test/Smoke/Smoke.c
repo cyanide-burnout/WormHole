@@ -194,11 +194,12 @@ static void TakeQueue(struct Context* context, uint32_t portion)
   }
 }
 
-static void HandleBell(struct WormHole* hole)
+static void HandleEvent(struct WormHole* hole, int event, int value)
 {
   struct Context* context;
 
-  if ((context = (struct Context*)hole->closure) &&
+  if ((event   == HOLE_EVENT_BELL) &&
+      (context = (struct Context*)hole->closure) &&
       (context->arena != NULL))
   {
     context->bells ++;
@@ -372,7 +373,7 @@ int main(int count, const char** arguments)
     return EXIT_FAILURE;
   }
 
-  if ((hole = CreateWormHole(arguments[1], HandleBell, &context)) == NULL)
+  if ((hole = CreateWormHole(arguments[1], HandleEvent, &context)) == NULL)
   {
     printf("Error opening ivshmem at %s\n", arguments[1]);
     return EXIT_FAILURE;

@@ -1,5 +1,6 @@
 #include "WormArena.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -66,6 +67,7 @@ static void TestArena(uint8_t* memory)
   int count;
   struct WormHole* hole;
   struct WormArena* arena;
+  struct WormArena* other;
   struct WormArenaCollection* pool;
   struct WormArenaCollection* queue;
   struct WormArenaCollection* region;
@@ -83,6 +85,13 @@ static void TestArena(uint8_t* memory)
   Check(RegisterWormArenaEntity(arena, "first", ARENA_LEASE, ARENA_TIMEOUT) == 0, "entity is registered");
   Check(RegisterWormArenaEntity(arena, "first", ARENA_LEASE, ARENA_TIMEOUT) < 0, "entity is not registered twice");
   Check(TouchWormArena(arena, ARENA_LEASE, ARENA_TIMEOUT) == 0, "lease is extended");
+
+  other = CreateWormArena(hole, "test");
+
+  Check(RegisterWormArenaEntity(other, "first", ARENA_LEASE, ARENA_TIMEOUT) == -EEXIST, "a name taken by somebody alive is refused");
+  Check(RegisterWormArenaEntity(other, "second", ARENA_LEASE, ARENA_TIMEOUT) == 0, "while another name is not");
+
+  ReleaseWormArena(other);
 
   pool   = CreateWormArenaPool(arena, "messages", POOL_BLOCKS, POOL_LENGTH, ARENA_TIMEOUT);
   region = CreateWormArenaRegion(arena, "state", 4096, ARENA_TIMEOUT);

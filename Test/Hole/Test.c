@@ -33,13 +33,16 @@ static void HandleSignal(int signal)
   atomic_store_explicit(&state, EXIT_SUCCESS, memory_order_relaxed);
 }
 
-void HandleBell(struct WormHole* hole)
+void HandleEvent(struct WormHole* hole, int event, int value)
 {
   struct Layout* layout;
 
-  layout = (struct Layout*)hole->memory;
+  if (event == HOLE_EVENT_BELL)
+  {
+    layout = (struct Layout*)hole->memory;
 
-  printf("%s\n", layout->message);
+    printf("%s\n", layout->message);
+  }
 }
 
 void HandleTimeout(struct FastRingDescriptor* descriptor)
@@ -89,7 +92,7 @@ int main(int count, const char** arguments)
     return EXIT_FAILURE;
   }
 
-  hole = CreateWormHole(arguments[1], HandleBell, NULL);
+  hole = CreateWormHole(arguments[1], HandleEvent, NULL);
 
   if (hole == NULL)
   {

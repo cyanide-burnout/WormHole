@@ -14,7 +14,7 @@ static void HandleInterruptEvent(struct FastRingDescriptor* descriptor, int resu
       (result & POLLIN))
   {
     // Value is read by the handler itself, watch reports readiness only
-    HandleWormHoleInterruptEvent(loop->hole, HOLE_CLIENT_VALUE_READ);
+    HandleWormHoleBellEvent(loop->hole, HOLE_CLIENT_VALUE_READ);
   }
 
   if ((result < 0) ||
@@ -23,7 +23,7 @@ static void HandleInterruptEvent(struct FastRingDescriptor* descriptor, int resu
     // Event source is gone, there is nothing to wait for anymore
     loop->source = NULL;
     RemoveFastRingWatch(descriptor);
-    HandleWormHoleLossEvent(loop->hole);
+    HandleWormHoleLossEvent(loop->hole, HOLE_LOST_SOURCE);
   }
 }
 
@@ -31,22 +31,28 @@ static void HandleHostServerEvent(struct FastRingDescriptor* descriptor, int res
 {
   struct WormLoop* loop;
   struct WormHole* hole;
+  int reported;
+  int handle;
   int status;
 
-  loop   = (struct WormLoop*)descriptor->closure;
-  hole   = loop->hole;
-  status = (result < 0) || (result & POLL_EVENT_LOST);
+  loop     = (struct WormLoop*)descriptor->closure;
+  hole     = loop->hole;
+  handle   = hole->handle;
+  status   = (result < 0) || (result & POLL_EVENT_LOST);
+  reported = 0;
 
   if ((result > 0) &&
       (result & POLLIN))
   {
-    // Messages are drained until the socket buffer gets empty
-    status |= (HandleWormHoleHostServerEvent(hole) <= 0);
+    // Messages are drained until the socket buffer gets empty, a loss found on the way is reported by the call itself
+    reported  = (HandleWormHoleServerEvent(hole) <= 0);
+    status   |= reported;
 
-    if ((loop->source == NULL) &&
+    if ((handle       <  0) &&
         (hole->handle >= 0))
     {
       // Server has just granted an eventfd of the peer itself, and without a watch on it no bell is heard again
+      // Only the moment of the grant counts: a source that has been watched and lost is not watched again
       loop->source  = AddFastRingWatch(loop->ring, hole->handle, POLLIN, 0, HandleInterruptEvent, loop);
       status       |= (loop->source == NULL);
     }
@@ -57,7 +63,12 @@ static void HandleHostServerEvent(struct FastRingDescriptor* descriptor, int res
     // Connection to ivshmem-server is gone, there is nothing to expect anymore
     loop->server = NULL;
     RemoveFastRingWatch(descriptor);
-    HandleWormHoleLossEvent(hole);
+
+    if (!reported)
+    {
+      // Otherwise it has been reported already
+      HandleWormHoleLossEvent(hole, HOLE_LOST_SERVER);
+    }
   }
 }
 
