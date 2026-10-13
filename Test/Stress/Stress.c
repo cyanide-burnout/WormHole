@@ -225,9 +225,11 @@ int main(int count, const char** arguments)
 
   for (index = 0; index <= UINT16_MAX; index ++)
   {
-    // Every eventfd that is not in a slot any more has been closed, and no kick holds a slot after all of them are over
+    // A slot packs the number of an eventfd with the count of kicks writing to it and a bit for a peer that has gone.
+    // Every eventfd that is not in a slot any more has been closed, and once the kicks are over no count is left
+    // in a slot and no peer that has gone
     live += (context.hole->host.handles[index] >= 0);
-    busy += (context.hole->host.handles[index] <  -1);
+    busy += (context.hole->host.handles[index] != -1) && (context.hole->host.handles[index] & 0xfff00000);
   }
 
   // Besides the eventfds and the traps, a hole keeps the socket, the shared memory and its own source
@@ -239,7 +241,7 @@ int main(int count, const char** arguments)
   Check(!left, "the server stays connected");
   Check(events > 0, "peers come and go, %ld passes", events);
   Check(stray == 0, "no kick reaches a descriptor that is no longer the eventfd of a peer, %ld did", stray);
-  Check(busy == 0, "no slot is left taken, %d are", busy);
+  Check(busy == 0, "no slot is left counting kicks or holding a peer that has gone, %d are", busy);
   Check(actual == expected, "no descriptor is lost or closed twice, %d open where %d are expected", actual, expected);
 
   ReleaseWormHole(context.hole);

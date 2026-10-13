@@ -100,13 +100,15 @@ A kick may be made from any thread. A guest kick touches nothing but the mapping
 registers. A host kick shares the table of eventfds with
 `HandleWormHoleServerEvent`, which closes the eventfd of a peer that leaves, and the
 number of a closed descriptor is handed out again at once to whatever the process opens
-next. So a host kick takes the eventfd out of its slot for the time of the write, with
-an atomic exchange, and puts it back afterwards. A peer that leaves meanwhile finds the
-slot taken and leaves the closing to the kick, so a descriptor is never closed while it
-is being written to. Two threads kicking the same peer at once take turns at its slot,
-the second one spinning for the time of a single write. A signal handler must not kick:
-having interrupted a kick of its own thread, it would wait for that very kick to give
-the slot back, and wait for good.
+next. So a slot of the table packs the number of the eventfd, in 20 bits, with the
+count of kicks writing to it and a bit for a peer that has gone. A kick counts itself
+in for the time of the write; a peer that leaves sets the bit, after which no kick
+counts itself in any more, and the eventfd is closed by whoever stops using it last,
+the departure itself when nobody is writing to it. A descriptor is never closed while
+it is being written to, and kicks of several threads write to one at once. Only a count
+that is full, 2047 kicks of one peer at the same moment, waits for one of them to end,
+and so does a peer that comes under the ID of one whose eventfd is still being written
+to.
 
 A peer may kick itself in both modes. `WormArena` rings peers through `KickWormHole`, so
 all of the above holds for `KickWormArenaEntity` and `KickAllWormArenaEntities` as well.

@@ -388,6 +388,7 @@ and the peers are forks of one process.
 
 * Only one IRQ vector is supported because of UIO limits
 * Due to byte-order depended implementation of ivshmem in QEMU a guest system should use the same byte-order as a host
+* In host mode the eventfds of peers have to be numbered below 2^20, the default of `fs.nr_open`; a peer whose eventfd gets a larger number can not be kicked
 
 ## Documentation
 

@@ -76,7 +76,7 @@ The fields the caller reads or sets:
 |-------|------|---------|
 | `type` | `int` | `HOLE_CLIENT_TYPE_GUEST` or `HOLE_CLIENT_TYPE_HOST` |
 | `closure` | `void*` | The `closure` given to `CreateWormHole`, for the events |
-| `identifier` | `uint64_t` | ID of this peer |
+| `identifier` | `int64_t` | ID of this peer |
 | `memory` | `uint8_t*` | The shared region |
 | `length` | `size_t` | Size of the shared region |
 | `handle` | `int` | Event source that delivers the bell; `-1` in host mode until the server has granted it |
@@ -84,10 +84,11 @@ The fields the caller reads or sets:
 | `host.socket` | `int` | Connection to *ivshmem-server*, host mode only |
 
 The rest belongs to the library: `kick`, `release` and `event`, the function given to
-`CreateWormHole`; `host.memory`, the
-descriptor of the shared object; `host.handles`, the eventfds of all peers by ID, `-1`
-where there is none and `-2` while a kick holds it; and `guest.registers`, the mapping of BAR0 of the device.
-`extension` is not used by the library.
+`CreateWormHole`; `host.memory`, the descriptor of the shared object; `host.handles`, the
+eventfds of all peers by ID, `-1` where there is none, each packed with the count of
+kicks writing to it and a bit for a peer that has gone (see [Kicks](LIFECYCLE.md#kicks));
+and `guest.registers`, the mapping of BAR0 of the device. `extension` is not used by the
+library.
 
 ### Functions
 

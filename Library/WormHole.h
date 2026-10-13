@@ -49,11 +49,11 @@ struct WormHole
   ReleaseWormHoleFunction release;
   HandleWormHoleEventFunction event;
 
-  uint64_t identifier;  // Local peer ID
-  uint8_t* memory;      // Pointer to shared memory
-  size_t length;        // Size of available shared memory
-  size_t size;          // Size of data to read from event source
-  int handle;           // Handle of event source
+  int64_t identifier;  // Local peer ID
+  uint8_t* memory;     // Pointer to shared memory
+  size_t length;       // Size of available shared memory
+  size_t size;         // Size of data to read from event source
+  int handle;          // Handle of event source
 
   union
   {

@@ -56,7 +56,7 @@ void HandleTimeout(struct FastRingDescriptor* descriptor)
   layout = (struct Layout*)hole->memory;
   number = atomic_fetch_add_explicit(&layout->number, 1, memory_order_relaxed);
 
-  sprintf(layout->message, "Bell id=%d pid=%d count=%d        ", hole->identifier, getpid(), number);
+  sprintf(layout->message, "Bell id=%d pid=%d count=%d        ", (int)hole->identifier, getpid(), number);
 
   number = 16;
 
@@ -100,7 +100,7 @@ int main(int count, const char** arguments)
     return EXIT_FAILURE;
   }
 
-  printf("Shared memory size: %lld\n", hole->length);
+  printf("Shared memory size: %lld\n", (long long)hole->length);
 
   //
 

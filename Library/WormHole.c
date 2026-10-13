@@ -23,7 +23,14 @@
 
 #define IVSHMEM_PROTOCOL_VERSION  0
 
-#define HOST_HANDLE_BUSY          -2
+// A slot of the table of peers packs the number of an eventfd with the count of kicks writing to it,
+// so that the eventfd of a peer that has gone is closed by whoever stops using it last
+
+#define HOST_HANDLE_EMPTY  ((uint32_t)-1)  // Peer is not known
+#define HOST_HANDLE_MASK   0x000fffffU     // Number of the eventfd, below the default of fs.nr_open
+#define HOST_HANDLE_USER   0x00100000U     // One kick writing to the eventfd right now
+#define HOST_HANDLE_BUSY   0x7ff00000U     // Count of kicks writing to the eventfd right now
+#define HOST_HANDLE_GONE   0x80000000U     // Peer has gone
 
 static int ReadHostServerMessage(struct WormHole* hole, int64_t* number, int* handle, int flags)
 {
@@ -66,10 +73,9 @@ static int ReadHostServerMessage(struct WormHole* hole, int64_t* number, int* ha
 
 static int KickHostWormHole(struct WormHole* hole, uint32_t identifier)
 {
-  _Atomic int* slot;
+  _Atomic uint32_t* slot;
   uint64_t value;
-  int expected;
-  int handle;
+  uint32_t state;
   int result;
 
   if (identifier > UINT16_MAX)
@@ -78,27 +84,29 @@ static int KickHostWormHole(struct WormHole* hole, uint32_t identifier)
     return -EBADF;
   }
 
-  slot = (_Atomic int*)hole->host.handles + identifier;
+  slot = (_Atomic uint32_t*)hole->host.handles + identifier;
 
-  // Wait while another thread is kicking the same peer, then take the handle: it is ours until it
-  // is given back, nobody closes it, and its number cannot be reused for something else meanwhile
-  while (((handle = atomic_load_explicit(slot, memory_order_acquire)) == HOST_HANDLE_BUSY) ||
-         ((handle >= 0) && (!atomic_compare_exchange_weak_explicit(slot, &handle, HOST_HANDLE_BUSY, memory_order_acquire, memory_order_relaxed))));
+  // Count this kick in as one writing to the eventfd: while it is written to nobody closes it, and its number
+  // cannot be reused for something else meanwhile. Only a count that is full waits for a write of another thread
+  while ((((state = atomic_load_explicit(slot, memory_order_acquire)) & HOST_HANDLE_GONE) == 0) &&
+         (((state & HOST_HANDLE_BUSY) == HOST_HANDLE_BUSY) ||
+          (!atomic_compare_exchange_weak_explicit(slot, &state, state + HOST_HANDLE_USER, memory_order_acquire, memory_order_relaxed))));
 
-  if (handle < 0)
+  if (state & HOST_HANDLE_GONE)
   {
     // Peer is not known or has gone
     return -EBADF;
   }
 
-  value    = 1ULL;
-  result   = -EBADF * (write(handle, &value, sizeof(uint64_t)) <= 0);
-  expected = HOST_HANDLE_BUSY;
+  value  = 1ULL;
+  result = -EBADF * (write(state & HOST_HANDLE_MASK, &value, sizeof(uint64_t)) <= 0);
+  state  = atomic_fetch_sub_explicit(slot, HOST_HANDLE_USER, memory_order_acq_rel) - HOST_HANDLE_USER;
 
-  if (!atomic_compare_exchange_strong_explicit(slot, &expected, handle, memory_order_release, memory_order_relaxed))
+  if ((state & (HOST_HANDLE_GONE | HOST_HANDLE_BUSY)) == HOST_HANDLE_GONE)
   {
-    // Peer has gone while the handle was taken, closing it is left to us
-    close(handle);
+    // Peer has gone while the eventfd was written to, and this kick is the last to stop writing to it
+    atomic_store_explicit(slot, HOST_HANDLE_EMPTY, memory_order_release);
+    close(state & HOST_HANDLE_MASK);
   }
 
   return result;
@@ -117,7 +125,7 @@ static void ReleaseHostWormHole(struct WormHole* hole)
     if (*handle != -1)
     {
       // Save syscalls and close only opened eventfd handles
-      close(*handle);
+      close(*handle & HOST_HANDLE_MASK);
     }
 
     handle ++;
@@ -152,7 +160,7 @@ static struct WormHole* CreateHostWormHole(const char* path, struct stat* status
         (strlen(path) >= sizeof(address.sun_path)) ||
         (connect(hole->host.socket, (struct sockaddr*)&address, sizeof(struct sockaddr_un)) < 0)                 ||
         (ReadHostServerMessage(hole, &value, NULL, 0) < 0)               || (value  != IVSHMEM_PROTOCOL_VERSION) ||
-        (ReadHostServerMessage(hole, (int64_t*)&hole->identifier, &handle, 0) < 0) || (handle != -1)             ||
+        (ReadHostServerMessage(hole, &hole->identifier, &handle, 0) < 0) || (handle != -1)                       ||
         (ReadHostServerMessage(hole, &value, &hole->host.memory, 0) < 0) || (value  != -1)                       ||
         (fstat(hole->host.memory, status) < 0)                                                                   ||
         ((hole->memory = (uint8_t*)mmap(NULL, status->st_size, PROT_READ | PROT_WRITE, MAP_SHARED, hole->host.memory, 0)) == MAP_FAILED))
@@ -178,13 +186,15 @@ static struct WormHole* CreateHostWormHole(const char* path, struct stat* status
 
 int HandleWormHoleServerEvent(struct WormHole* hole)
 {
+  _Atomic uint32_t* slot;
+  uint32_t state;
   int64_t number;
-  int handle;
+  int condition;
   int result;
-  int ready;
+  int handle;
 
-  ready  = 0;
-  result = 0;
+  condition = 0;
+  result    = 0;
 
   while (hole->type == HOLE_CLIENT_TYPE_HOST)
   {
@@ -214,24 +224,37 @@ int HandleWormHoleServerEvent(struct WormHole* hole)
       // It is allowed to trigger itself to unify behavior between host and guest modes:
       // In case of guest mode it's suitable to communicate between multiple clients on the same host
       hole->handle = dup(handle);
-      ready        = (hole->handle >= 0);
+      condition    = (hole->handle >= 0);
     }
 
     if ((number >= 0) &&
         (number <= UINT16_MAX))
     {
-      if ((handle != -1) && (atomic_load_explicit((_Atomic int*)hole->host.handles + number, memory_order_relaxed) == -1))
+      slot = (_Atomic uint32_t*)hole->host.handles + number;
+
+      if (handle != -1)
       {
-        atomic_store_explicit((_Atomic int*)hole->host.handles + number, handle, memory_order_release);
-        continue;
+        // A peer that has gone under the same ID may still have its eventfd written to, the last write is waited for
+        while (((state = atomic_load_explicit(slot, memory_order_acquire)) != HOST_HANDLE_EMPTY) &&
+               (state & HOST_HANDLE_GONE));
+
+        if ((state  == HOST_HANDLE_EMPTY) &&
+            (handle <= HOST_HANDLE_MASK))
+        {
+          // Otherwise it is one more vector of a known peer, or a number too large to be kept
+          atomic_store_explicit(slot, handle, memory_order_release);
+          continue;
+        }
       }
 
-      if ((handle == -1) && (atomic_load_explicit((_Atomic int*)hole->host.handles + number, memory_order_relaxed) != -1))
+      if ((handle == -1) &&
+          ((atomic_load_explicit(slot, memory_order_relaxed) & HOST_HANDLE_GONE) == 0))
       {
-        if ((handle = atomic_exchange_explicit((_Atomic int*)hole->host.handles + number, -1, memory_order_acq_rel)) >= 0)
+        if (((state = atomic_fetch_or_explicit(slot, HOST_HANDLE_GONE, memory_order_acq_rel)) & HOST_HANDLE_BUSY) == 0)
         {
-          // Otherwise a kick of another thread has the handle taken, and it is that kick to close it
-          close(handle);
+          // Otherwise a kick is writing to the eventfd right now, and the last of them closes it
+          atomic_store_explicit(slot, HOST_HANDLE_EMPTY, memory_order_release);
+          close(state & HOST_HANDLE_MASK);
         }
 
         continue;
@@ -245,7 +268,7 @@ int HandleWormHoleServerEvent(struct WormHole* hole)
     }
   }
 
-  if ((ready != 0) &&
+  if ((condition   != 0) &&
       (hole->event != NULL))
   {
     // Own eventfd is in the table by now, after the ones of the peers that were there before
